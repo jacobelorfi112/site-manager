@@ -71,7 +71,66 @@ func migrate(conn *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_sites_url    ON sites(url);
 		ALTER TABLE sites ADD COLUMN IF NOT EXISTS checkout_price NUMERIC(10,2) NOT NULL DEFAULT 0;
 	`)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Exec(`
+		CREATE TABLE IF NOT EXISTS proxies (
+			id          BIGSERIAL PRIMARY KEY,
+			url         TEXT NOT NULL UNIQUE,
+			status      TEXT NOT NULL DEFAULT 'working',
+			last_tested TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status);
+	`)
 	return err
+}
+
+// AddProxies inserts working proxies, updating last_tested if already present.
+// Returns count of newly inserted rows.
+func (db *DB) AddProxies(urls []string) int {
+	added := 0
+	for _, u := range urls {
+		res, err := db.conn.Exec(`
+			INSERT INTO proxies (url, status, last_tested)
+			VALUES ($1, 'working', NOW())
+			ON CONFLICT (url) DO UPDATE SET status='working', last_tested=NOW()
+		`, u)
+		if err == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				added++
+			}
+		}
+	}
+	return added
+}
+
+// GetWorkingProxies returns all proxy URLs with status = 'working'.
+func (db *DB) GetWorkingProxies() []string {
+	rows, err := db.conn.Query(`SELECT url FROM proxies WHERE status = 'working' ORDER BY last_tested DESC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var u string
+		if rows.Scan(&u) == nil {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// DeleteProxy removes a proxy by URL (called when it fails in production).
+func (db *DB) DeleteProxy(proxyURL string) {
+	db.conn.Exec(`DELETE FROM proxies WHERE url = $1`, proxyURL)
+}
+
+// ClearProxies removes all proxies.
+func (db *DB) ClearProxies() {
+	db.conn.Exec(`DELETE FROM proxies`)
 }
 
 // ClaimPending atomically claims up to limit pending sites, sets them to checking.
