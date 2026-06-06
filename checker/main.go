@@ -79,14 +79,14 @@ func main() {
 
 	pool := NewProxyPool(db)
 
-	concurrency := 5
+	concurrency := 20
 	if v := os.Getenv("CHECKER_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			concurrency = n
 		}
 	}
 
-	batchSize := concurrency * 2
+	batchSize := concurrency * 3
 	if v := os.Getenv("CHECKER_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			batchSize = n
@@ -124,40 +124,48 @@ func runWorker(db *DB, pool *ProxyPool, concurrency, batchSize int, stop <-chan 
 	}
 
 	sem := make(chan struct{}, concurrency)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	stuckTicker := time.NewTicker(30 * time.Second)
+	defer stuckTicker.Stop()
 
 	for {
 		select {
 		case <-stop:
 			return
-		case <-ticker.C:
+		case <-stuckTicker.C:
 			if n, err := db.ResetStuck(); err == nil && n > 0 {
 				log.Printf("[worker] Reset %d stuck sites", n)
 			}
-
-			sites, err := db.ClaimPending(batchSize)
-			if err != nil {
-				log.Printf("[worker] ClaimPending error: %v", err)
-				continue
-			}
-			if len(sites) == 0 {
-				continue
-			}
-
-			log.Printf("[worker] Checking %d sites...", len(sites))
-			var wg sync.WaitGroup
-			for _, site := range sites {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(s Site) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					checkSite(db, s, pool)
-				}(site)
-			}
-			wg.Wait()
+		default:
 		}
+
+		sites, err := db.ClaimPending(batchSize)
+		if err != nil {
+			log.Printf("[worker] ClaimPending error: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if len(sites) == 0 {
+			// Nothing pending — short sleep then retry
+			select {
+			case <-stop:
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
+		log.Printf("[worker] Checking %d sites...", len(sites))
+		var wg sync.WaitGroup
+		for _, site := range sites {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(s Site) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				checkSite(db, s, pool)
+			}(site)
+		}
+		wg.Wait()
 	}
 }
 
