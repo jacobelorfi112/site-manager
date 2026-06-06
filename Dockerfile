@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir requests urllib3 psycopg2-binary beautifulsoup4
+RUN pip install --no-cache-dir requests urllib3 psycopg2-binary
 
 COPY scraper_worker.py .
 

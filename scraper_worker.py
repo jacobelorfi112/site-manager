@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Scraper Worker — Finds Shopify sites via Yahoo & Brave and stores them
-directly in PostgreSQL for the checker service to process later.
+Scraper Worker — Discovers Shopify stores via RapidDNS + HackerTarget
+(subdomain enumeration APIs that work from datacenter IPs) and stores
+them directly in PostgreSQL for the checker service to process later.
 
 Environment variables:
   DATABASE_URL          — PostgreSQL connection string (required)
-  SCRAPER_BATCH_SIZE    — URLs to buffer before inserting (default: 50)
-  SCRAPER_SEARCHES      — Search iterations per cycle (default: 100)
-  SCRAPER_CYCLE_DELAY   — Seconds to sleep between cycles (default: 30)
-  SCRAPER_MIN_DELAY     — Min seconds between requests (default: 1.5)
-  SCRAPER_MAX_DELAY     — Max seconds between requests (default: 3.0)
+  SCRAPER_BATCH_SIZE    — URLs to buffer before inserting (default: 100)
+  SCRAPER_REQUESTS      — API requests per cycle (default: 20)
+  SCRAPER_CYCLE_DELAY   — Seconds between cycles (default: 15)
 """
 
 import os
@@ -26,196 +25,136 @@ import requests
 urllib3.disable_warnings()
 
 # ── Config ──────────────────────────────────────────────────────────
-DATABASE_URL        = os.environ.get("DATABASE_URL", "")
-BATCH_SIZE          = int(os.environ.get("SCRAPER_BATCH_SIZE", "50"))
-SEARCHES_PER_CYCLE  = int(os.environ.get("SCRAPER_SEARCHES", "100"))
-CYCLE_DELAY         = int(os.environ.get("SCRAPER_CYCLE_DELAY", "30"))
-MIN_DELAY           = float(os.environ.get("SCRAPER_MIN_DELAY", "1.5"))
-MAX_DELAY           = float(os.environ.get("SCRAPER_MAX_DELAY", "3.0"))
-
-# ── Search engines ───────────────────────────────────────────────────
-ENGINES = [
-    {
-        "name": "Yahoo",
-        "url": "https://search.yahoo.com/search",
-        "param": "p",
-        "weight": 0.55,
-        "extra_params": {},
-    },
-    {
-        "name": "Brave",
-        "url": "https://search.brave.com/search",
-        "param": "q",
-        "weight": 0.45,
-        "extra_params": {},
-    },
-]
+DATABASE_URL       = os.environ.get("DATABASE_URL", "")
+BATCH_SIZE         = int(os.environ.get("SCRAPER_BATCH_SIZE", "100"))
+REQUESTS_PER_CYCLE = int(os.environ.get("SCRAPER_REQUESTS", "20"))
+CYCLE_DELAY        = int(os.environ.get("SCRAPER_CYCLE_DELAY", "15"))
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-]
-
-DORKS = [
-    'site:myshopify.com store',
-    'site:myshopify.com shop',
-    'site:myshopify.com buy now',
-    'site:myshopify.com products',
-    'site:myshopify.com collection',
-    'site:myshopify.com checkout',
-    'site:myshopify.com sale',
-    'site:myshopify.com clothing',
-    'site:myshopify.com shoes',
-    'site:myshopify.com jewelry',
-    'site:myshopify.com accessories',
-    'site:myshopify.com beauty',
-    'site:myshopify.com skincare',
-    'site:myshopify.com makeup',
-    'site:myshopify.com electronics',
-    'site:myshopify.com fitness',
-    'site:myshopify.com supplements',
-    'site:myshopify.com pet supplies',
-    'site:myshopify.com home decor',
-    'site:myshopify.com candles',
-    'site:myshopify.com handmade',
-    'site:myshopify.com vintage',
-    'site:myshopify.com fashion',
-    'site:myshopify.com kids',
-    'site:myshopify.com outdoor',
-    'site:myshopify.com art',
-    'site:myshopify.com coffee',
-    'site:myshopify.com food',
-    'site:myshopify.com gift',
-    'site:myshopify.com cheap',
-    'site:myshopify.com affordable',
-    'site:myshopify.com discount',
-    'site:myshopify.com free shipping',
-    'site:myshopify.com bundle',
-    'site:myshopify.com new arrivals',
-    'site:myshopify.com best seller',
-    'site:myshopify.com trending',
-    'site:myshopify.com luxury',
-    'site:myshopify.com organic',
-    'site:myshopify.com',
 ]
 
 # ── URL extraction ──────────────────────────────────────────────────
-MYSHOPIFY_RE = re.compile(r"https?://([a-z0-9\-]+)\.myshopify\.com", re.IGNORECASE)
+MYSHOPIFY_RE = re.compile(r"\b([a-z0-9][a-z0-9\-]{1,}[a-z0-9])\.myshopify\.com\b", re.IGNORECASE)
 
 
-def normalize_url(raw: str) -> str | None:
-    m = MYSHOPIFY_RE.search(raw)
-    if not m:
-        return None
-    store = m.group(1).lower().strip("-")
-    if len(store) < 3:
-        return None
-    return f"https://{store}.myshopify.com"
-
-
-def extract_shopify_urls(text: str) -> set[str]:
-    urls = set()
+def extract_stores(text: str) -> set[str]:
+    stores = set()
     for m in MYSHOPIFY_RE.finditer(text):
-        n = normalize_url(m.group(0))
-        if n:
-            urls.add(n)
-    return urls
+        store = m.group(1).lower().strip("-")
+        if len(store) >= 3:
+            stores.add(f"https://{store}.myshopify.com")
+    return stores
 
 
-# ── Search ──────────────────────────────────────────────────────────
-def search_engine(session: requests.Session, engine: dict, query: str) -> tuple[set[str], int, str]:
-    """Returns (urls_found, http_status, error_message)."""
-    params = {engine["param"]: query, **engine["extra_params"]}
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+# ── Sources ──────────────────────────────────────────────────────────
+
+def fetch_rapiddns(session: requests.Session, page: int) -> tuple[set[str], str]:
+    """
+    RapidDNS returns ~100 different myshopify subdomains per page,
+    with almost no overlap between pages — behaves like random sampling.
+    """
+    url = f"https://rapiddns.io/subdomain/myshopify.com?full=1&page={page}#result"
     try:
-        resp = session.get(
-            engine["url"],
-            params=params,
-            headers=headers,
-            timeout=15,
-            allow_redirects=True,
-        )
-        status = resp.status_code
-        if status == 429:
-            return set(), status, "rate limited"
-        if status == 403:
-            return set(), status, "blocked"
-        if status != 200:
-            return set(), status, f"HTTP {status}"
-        urls = extract_shopify_urls(resp.text)
-        return urls, status, ""
-    except requests.exceptions.Timeout:
-        return set(), 0, "timeout"
-    except requests.exceptions.ConnectionError as e:
-        return set(), 0, f"connection error: {e}"
+        resp = session.get(url, timeout=15, allow_redirects=True,
+                           headers={"User-Agent": random.choice(USER_AGENTS)})
+        if resp.status_code != 200:
+            return set(), f"HTTP {resp.status_code}"
+        stores = extract_stores(resp.text)
+        return stores, ""
     except Exception as e:
-        return set(), 0, f"error: {e}"
+        return set(), str(e)
 
 
-# Rate-limit backoff state per engine
-_backoff: dict[str, float] = {}
+def fetch_hackertarget(session: requests.Session) -> tuple[set[str], str]:
+    """HackerTarget hostsearch returns ~50 myshopify subdomains."""
+    url = "https://api.hackertarget.com/hostsearch/?q=myshopify.com"
+    try:
+        resp = session.get(url, timeout=15, allow_redirects=True,
+                           headers={"User-Agent": random.choice(USER_AGENTS)})
+        if resp.status_code != 200:
+            return set(), f"HTTP {resp.status_code}"
+        if "API count exceeded" in resp.text or "error" in resp.text.lower()[:50]:
+            return set(), f"rate limited: {resp.text[:80]}"
+        stores = extract_stores(resp.text)
+        return stores, ""
+    except Exception as e:
+        return set(), str(e)
 
 
-def scrape_cycle(num_searches: int) -> set[str]:
+def fetch_commoncrawl(session: requests.Session, index: str, page: int) -> tuple[set[str], str]:
+    """CommonCrawl index API — supplementary source."""
+    url = f"https://index.commoncrawl.org/{index}-index?url=*.myshopify.com&output=json&limit=100&page={page}"
+    try:
+        resp = session.get(url, timeout=20, allow_redirects=True,
+                           headers={"User-Agent": random.choice(USER_AGENTS)})
+        if resp.status_code == 404:
+            return set(), f"index not found"
+        if resp.status_code != 200:
+            return set(), f"HTTP {resp.status_code}"
+        stores = extract_stores(resp.text)
+        return stores, ""
+    except Exception as e:
+        return set(), str(e)
+
+
+COMMONCRAWL_INDEXES = [
+    "CC-MAIN-2024-51",
+    "CC-MAIN-2024-46",
+    "CC-MAIN-2024-42",
+    "CC-MAIN-2024-38",
+    "CC-MAIN-2024-33",
+    "CC-MAIN-2024-26",
+]
+
+
+def scrape_cycle(num_requests: int, seen: set[str]) -> set[str]:
     found: set[str] = set()
     session = requests.Session()
     session.verify = False
-    weights = [e["weight"] for e in ENGINES]
-    consecutive_failures = {e["name"]: 0 for e in ENGINES}
 
-    for i in range(1, num_searches + 1):
-        # Pick engine, skip if in backoff
-        available = [e for e in ENGINES if time.time() >= _backoff.get(e["name"], 0)]
-        if not available:
-            wait = min(_backoff.get(e["name"], 0) for e in ENGINES) - time.time()
-            print(f"  [{i}/{num_searches}] All engines in backoff, waiting {wait:.0f}s...", flush=True)
-            time.sleep(max(wait, 1))
-            available = ENGINES
+    ht_done = False
+    rapiddns_page = random.randint(1, 200)
+    cc_index_idx = 0
+    cc_page = 0
 
-        avail_weights = [e["weight"] for e in available]
-        engine = random.choices(available, weights=avail_weights, k=1)[0]
-        query = random.choice(DORKS)
-
-        urls, status, err = search_engine(session, engine, query)
+    for i in range(1, num_requests + 1):
+        # Rotate sources: HackerTarget once, then alternate RapidDNS / CommonCrawl
+        if not ht_done:
+            stores, err = fetch_hackertarget(session)
+            source = "HackerTarget"
+            ht_done = True
+        elif i % 4 == 0 and cc_index_idx < len(COMMONCRAWL_INDEXES):
+            index = COMMONCRAWL_INDEXES[cc_index_idx % len(COMMONCRAWL_INDEXES)]
+            stores, err = fetch_commoncrawl(session, index, cc_page)
+            source = f"CommonCrawl/{index}/p{cc_page}"
+            cc_page += 1
+            if cc_page > 10:
+                cc_page = 0
+                cc_index_idx += 1
+        else:
+            stores, err = fetch_rapiddns(session, rapiddns_page)
+            source = f"RapidDNS/p{rapiddns_page}"
+            rapiddns_page = random.randint(1, 500)
 
         if err:
-            consecutive_failures[engine["name"]] += 1
-            fails = consecutive_failures[engine["name"]]
-            if status == 429 or fails >= 3:
-                backoff_secs = min(60 * fails, 300)
-                _backoff[engine["name"]] = time.time() + backoff_secs
-                print(f"  [{i}/{num_searches}] {engine['name']} | {err} — backing off {backoff_secs}s", flush=True)
-            else:
-                print(f"  [{i}/{num_searches}] {engine['name']} | query='{query}' -> {err}", flush=True)
+            print(f"  [{i}/{num_requests}] {source} -> ERROR: {err}", flush=True)
         else:
-            consecutive_failures[engine["name"]] = 0
-            new = urls - found
-            found.update(new)
-            if new:
-                print(f"  [{i}/{num_searches}] {engine['name']} | '{query}' -> +{len(new)} new URLs (cycle total: {len(found)})", flush=True)
-            else:
-                print(f"  [{i}/{num_searches}] {engine['name']} | '{query}' -> {len(urls)} URLs (all seen)", flush=True)
+            new = stores - found - seen
+            found.update(stores)
+            print(f"  [{i}/{num_requests}] {source} -> {len(stores)} stores, +{len(new)} new", flush=True)
 
-        delay = random.uniform(MIN_DELAY, MAX_DELAY)
-        time.sleep(delay)
+        time.sleep(random.uniform(0.5, 1.5))
 
     return found
 
 
 # ── Database ─────────────────────────────────────────────────────────
-def connect_db():
+
+def connect_db() -> psycopg2.extensions.connection:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is not set")
     conn = psycopg2.connect(DATABASE_URL)
@@ -269,13 +208,12 @@ def get_stats(conn) -> dict:
 
 
 # ── Main loop ───────────────────────────────────────────────────────
+
 def main():
     print("Scraper Worker starting", flush=True)
-    print(f"  Engines: {', '.join(e['name'] for e in ENGINES)}", flush=True)
-    print(f"  Searches per cycle: {SEARCHES_PER_CYCLE}", flush=True)
-    print(f"  Request delay: {MIN_DELAY}–{MAX_DELAY}s", flush=True)
+    print(f"  Sources: RapidDNS, HackerTarget, CommonCrawl", flush=True)
+    print(f"  Requests per cycle: {REQUESTS_PER_CYCLE}", flush=True)
     print(f"  Cycle delay: {CYCLE_DELAY}s", flush=True)
-    sys.stdout.flush()
 
     conn = connect_db()
     print("Database connected", flush=True)
@@ -294,25 +232,22 @@ def main():
         cycle += 1
         stats = get_stats(conn)
         print(f"\n{'='*55}", flush=True)
-        print(f"[Cycle {cycle}] DB: {stats['total']} total | {stats.get('pending',0)} pending | {stats.get('working',0)} working", flush=True)
-        print(f"Starting {SEARCHES_PER_CYCLE} searches...", flush=True)
+        print(f"[Cycle {cycle}] DB: {stats['total']} total | "
+              f"{stats.get('pending', 0)} pending | {stats.get('working', 0)} working", flush=True)
 
-        found = scrape_cycle(SEARCHES_PER_CYCLE)
+        found = scrape_cycle(REQUESTS_PER_CYCLE, seen)
         total_found += len(found)
 
         new_urls = [u for u in found if u not in seen]
         seen.update(new_urls)
 
         added = 0
-        if new_urls:
-            for i in range(0, len(new_urls), BATCH_SIZE):
-                n = insert_sites(conn, new_urls[i:i + BATCH_SIZE])
-                added += n
-            total_added += added
+        for i in range(0, len(new_urls), BATCH_SIZE):
+            added += insert_sites(conn, new_urls[i:i + BATCH_SIZE])
+        total_added += added
 
-        print(f"\n[Cycle {cycle}] Done — found {len(found)}, {added} new in DB", flush=True)
-        print(f"All-time: {total_found} found, {total_added} added to DB", flush=True)
-        print(f"Sleeping {CYCLE_DELAY}s before next cycle...", flush=True)
+        print(f"\n[Cycle {cycle}] Done — {len(found)} found, {added} new in DB", flush=True)
+        print(f"All-time: {total_found} found, {total_added} added | sleeping {CYCLE_DELAY}s...", flush=True)
         time.sleep(CYCLE_DELAY)
 
 
