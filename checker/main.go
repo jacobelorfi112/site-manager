@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	tele "gopkg.in/telebot.v4"
 )
 
 const testCard = "4242424242424242|03|30|000"
@@ -104,6 +108,9 @@ func main() {
 	// Start proxy manager Telegram bot
 	go StartProxyBot(db, pool)
 
+	// Every 2 hours send all working sites as a .txt file to the notify chat
+	go startSiteNotifier(db)
+
 	stop := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -169,8 +176,7 @@ func runWorker(db *DB, pool *ProxyPool, concurrency, batchSize int, stop <-chan 
 	}
 }
 
-func checkSite(db *DB, site Site, pool *ProxyPool) {
-	defer func() {
+func checkSite(db *DB, site Site, pool *ProxyPool) {	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[checker] PANIC on %s: %v", site.URL, r)
 			db.MarkError(site.ID, "PANIC", fmt.Sprintf("%v", r))
@@ -228,5 +234,68 @@ func checkSite(db *DB, site Site, pool *ProxyPool) {
 		}
 		log.Printf("[checker] DEAD: %s (%s) %s", site.URL, code, msg)
 		db.MarkDead(site.ID, code, msg)
+	}
+}
+
+// startSiteNotifier sends all working sites as a .txt file to the proxy bot
+// chat every 2 hours. Set NOTIFY_CHAT_ID env var to your Telegram user/chat ID.
+func startSiteNotifier(db *DB) {
+	chatIDStr := os.Getenv("NOTIFY_CHAT_ID")
+	if chatIDStr == "" {
+		log.Println("[notifier] NOTIFY_CHAT_ID not set — site notifications disabled")
+		return
+	}
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		log.Printf("[notifier] Invalid NOTIFY_CHAT_ID: %v", err)
+		return
+	}
+
+	bot, err := tele.NewBot(tele.Settings{
+		Token:  proxyBotToken,
+		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+	})
+	if err != nil {
+		log.Printf("[notifier] Failed to create bot: %v", err)
+		return
+	}
+
+	sendSites := func() {
+		sites, total, err := db.GetWorking(10000, 0)
+		if err != nil {
+			log.Printf("[notifier] DB error: %v", err)
+			return
+		}
+		if total == 0 {
+			log.Println("[notifier] No working sites to send")
+			return
+		}
+
+		var sb strings.Builder
+		for _, s := range sites {
+			sb.WriteString(s.URL)
+			if s.Price > 0 {
+				sb.WriteString(fmt.Sprintf(" | $%.2f", s.Price))
+			}
+			sb.WriteString("\n")
+		}
+
+		doc := &tele.Document{
+			File:     tele.FromReader(bytes.NewBufferString(sb.String())),
+			FileName: fmt.Sprintf("working_sites_%d.txt", total),
+			Caption:  fmt.Sprintf("✅ *%d Working Sites* — auto report", total),
+		}
+		if _, err := bot.Send(tele.ChatID(chatID), doc, tele.ModeMarkdown); err != nil {
+			log.Printf("[notifier] Failed to send: %v", err)
+		} else {
+			log.Printf("[notifier] Sent %d working sites to chat %d", total, chatID)
+		}
+	}
+
+	// Send once on startup after a short delay, then every 2 hours
+	time.Sleep(30 * time.Second)
+	sendSites()
+	for range time.Tick(2 * time.Hour) {
+		sendSites()
 	}
 }
