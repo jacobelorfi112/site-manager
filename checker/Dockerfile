@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.22-alpine AS builder
 WORKDIR /app
 # git is required by go mod tidy to fetch dependencies from GitHub
 RUN apk add --no-cache git

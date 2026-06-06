@@ -1,6 +1,6 @@
 module site-checker
 
-go 1.21
+go 1.22
 
 require (
 	github.com/bogdanfinn/fhttp v0.5.28
