@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -21,6 +22,47 @@ import (
 )
 
 // ──────────────────────── CheckResult ─────────────────────────────────
+
+type CheckStatus int
+
+const (
+	StatusCharged  CheckStatus = iota // ORDER_PLACED
+	StatusApproved                    // non-charged success
+	StatusDeclined                    // FailedReceipt or 3DS
+	StatusError                       // could not complete checkout flow
+)
+
+type CheckResult struct {
+	Card       string
+	Status     CheckStatus
+	StatusCode string
+	Amount     string
+	Currency   string
+	SiteName   string
+	ShopURL    string
+	Gateway    string
+	Error      error
+	Retryable  bool
+}
+
+// ──────────────────────── Shopify JSON models ────────────────────────
+
+type ProductsResponse struct {
+	Products []Product `json:"products"`
+}
+
+type Product struct {
+	ID       int64     `json:"id"`
+	Title    string    `json:"title"`
+	Variants []Variant `json:"variants"`
+}
+
+type Variant struct {
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	Price     string `json:"price"`
+	Available bool   `json:"available"`
+}
 
 // ──────────────────────── Step 0: find cheapest available product ────
 
