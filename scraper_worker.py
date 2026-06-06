@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Scraper Worker — Finds Shopify sites via Tempest (Bing) and stores them
+Scraper Worker — Finds Shopify sites via Yahoo & Brave search and stores them
 directly in PostgreSQL for the checker service to process later.
 
 Environment variables:
   DATABASE_URL          — PostgreSQL connection string (required)
-  TEMPEST_COUNTRY       — 2-letter country code, e.g. "US" (default: US)
   SCRAPER_BATCH_SIZE    — URLs to buffer before inserting (default: 50)
-  SCRAPER_SEARCHES      — Search iterations per cycle (default: 500)
+  SCRAPER_SEARCHES      — Search iterations per cycle (default: 200)
   SCRAPER_CYCLE_DELAY   — Seconds to sleep between cycles (default: 30)
 """
 
@@ -20,76 +19,81 @@ import urllib3
 import psycopg2
 import psycopg2.extras
 import requests
+from bs4 import BeautifulSoup
 
 urllib3.disable_warnings()
 
 # ── Config ──────────────────────────────────────────────────────────
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-TEMPEST_BASE = "https://search-api.global.tempest.com"
-TEMPEST_V1_SEARCH = f"{TEMPEST_BASE}/v1/search/"
-
-TEMPEST_COUNTRY = os.environ.get("TEMPEST_COUNTRY", "US") or None
-
-IPAD_UA = (
-    "Mozilla/5.0 (iPad; U; CPU OS 3_2_1 like Mac OS X; en-us) "
-    "AppleWebKit/531.21.10 (KHTML, like Gecko) Mobile/7B405"
-)
-
+DATABASE_URL        = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE          = int(os.environ.get("SCRAPER_BATCH_SIZE", "50"))
-SEARCHES_PER_CYCLE  = int(os.environ.get("SCRAPER_SEARCHES", "500"))
+SEARCHES_PER_CYCLE  = int(os.environ.get("SCRAPER_SEARCHES", "200"))
 CYCLE_DELAY         = int(os.environ.get("SCRAPER_CYCLE_DELAY", "30"))
 
-# ── Dorks ───────────────────────────────────────────────────────────
+# ── Search engines (Yahoo + Brave — confirmed working) ───────────────
+ENGINES = [
+    {
+        "name": "Yahoo",
+        "url": "https://search.yahoo.com/search",
+        "param": "p",
+        "weight": 0.5,
+    },
+    {
+        "name": "Brave",
+        "url": "https://search.brave.com/search",
+        "param": "q",
+        "weight": 0.5,
+    },
+]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
+]
+
 DORKS = [
     'site:myshopify.com',
     'site:myshopify.com store',
     'site:myshopify.com shop',
-    'site:myshopify.com buy',
+    'site:myshopify.com buy now',
     'site:myshopify.com products',
     'site:myshopify.com collection',
-    'site:myshopify.com cart',
     'site:myshopify.com checkout',
-    'site:myshopify.com new',
     'site:myshopify.com sale',
-    'site:myshopify.com deals',
-    'site:myshopify.com best seller',
-    'site:myshopify.com trending',
-    'site:myshopify.com popular',
-    'site:myshopify.com gift',
-    'site:myshopify.com bundle',
-    'site:myshopify.com makeup',
-    'site:myshopify.com cosmetics',
-    'site:myshopify.com beauty',
-    'site:myshopify.com skincare',
     'site:myshopify.com clothing',
     'site:myshopify.com shoes',
     'site:myshopify.com jewelry',
     'site:myshopify.com accessories',
+    'site:myshopify.com beauty',
+    'site:myshopify.com skincare',
+    'site:myshopify.com makeup',
     'site:myshopify.com electronics',
     'site:myshopify.com fitness',
-    'site:myshopify.com pet',
-    'site:myshopify.com home decor',
-    'site:myshopify.com furniture',
-    'site:myshopify.com vitamins',
     'site:myshopify.com supplements',
-    'site:myshopify.com organic',
+    'site:myshopify.com pet supplies',
+    'site:myshopify.com home decor',
+    'site:myshopify.com candles',
     'site:myshopify.com handmade',
     'site:myshopify.com vintage',
-    'site:myshopify.com luxury',
     'site:myshopify.com fashion',
     'site:myshopify.com kids',
-    'site:myshopify.com baby',
     'site:myshopify.com outdoor',
-    'site:myshopify.com sports',
-    'site:myshopify.com tech',
-    'site:myshopify.com gadgets',
     'site:myshopify.com art',
-    'site:myshopify.com candles',
     'site:myshopify.com coffee',
-    'site:myshopify.com tea',
     'site:myshopify.com food',
-    'site:myshopify.com snacks',
+    'site:myshopify.com gift',
+    'site:myshopify.com cheap',
+    'site:myshopify.com affordable',
+    'site:myshopify.com discount',
+    'site:myshopify.com free shipping',
+    'site:myshopify.com bundle',
+    'site:myshopify.com new arrivals',
+    'site:myshopify.com best seller',
+    'site:myshopify.com trending',
+    'site:myshopify.com luxury',
+    'site:myshopify.com organic',
 ]
 
 # ── URL extraction ──────────────────────────────────────────────────
@@ -115,6 +119,55 @@ def extract_shopify_urls(text: str) -> set[str]:
     return urls
 
 
+# ── Search ──────────────────────────────────────────────────────────
+def search_engine(session: requests.Session, engine: dict, query: str) -> set[str]:
+    params = {engine["param"]: query}
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+    }
+    try:
+        resp = session.get(
+            engine["url"],
+            params=params,
+            headers=headers,
+            timeout=15,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return set()
+        return extract_shopify_urls(resp.text)
+    except Exception:
+        return set()
+
+
+def scrape_cycle(num_searches: int) -> set[str]:
+    found: set[str] = set()
+    session = requests.Session()
+    session.verify = False
+
+    weights = [e["weight"] for e in ENGINES]
+
+    for i in range(num_searches):
+        engine = random.choices(ENGINES, weights=weights, k=1)[0]
+        query = random.choice(DORKS)
+
+        urls = search_engine(session, engine, query)
+        if urls:
+            new = urls - found
+            if new:
+                found.update(new)
+                print(f"  [{i+1}/{num_searches}] {engine['name']} +{len(new)} (total: {len(found)})")
+
+        time.sleep(random.uniform(1.0, 2.5))
+
+    return found
+
+
 # ── Database ─────────────────────────────────────────────────────────
 def connect_db():
     if not DATABASE_URL:
@@ -125,7 +178,6 @@ def connect_db():
 
 
 def ensure_schema(conn):
-    """Create the sites table if it doesn't exist (matches the checker's schema)."""
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sites (
@@ -147,7 +199,6 @@ def ensure_schema(conn):
 
 
 def insert_sites(conn, urls: list[str]) -> int:
-    """Insert new URLs, ignoring duplicates. Returns count of newly added rows."""
     if not urls:
         return 0
     with conn.cursor() as cur:
@@ -167,92 +218,14 @@ def get_stats(conn) -> dict:
         cur.execute("SELECT status, COUNT(*) FROM sites GROUP BY status")
         rows = cur.fetchall()
     stats = {row[0]: row[1] for row in rows}
-    stats.setdefault("pending", 0)
-    stats.setdefault("checking", 0)
-    stats.setdefault("working", 0)
-    stats.setdefault("dead", 0)
-    stats.setdefault("error", 0)
     stats["total"] = sum(stats.values())
     return stats
-
-
-# ── Tempest scraper ─────────────────────────────────────────────────
-def scrape_tempest(num_searches: int = 500) -> set[str]:
-    found = set()
-    consecutive_failures = 0
-
-    session = requests.Session()
-    session.verify = False
-
-    for i in range(num_searches):
-        if consecutive_failures >= 30:
-            print(f"  Too many failures ({consecutive_failures}), pausing 5s...")
-            time.sleep(5)
-            consecutive_failures = 0
-
-        query = random.choice(DORKS)
-        offset = random.choice([0, 50, 100])
-
-        params = {"q": query, "count": "50", "offset": str(offset)}
-        if TEMPEST_COUNTRY:
-            params["cc"] = TEMPEST_COUNTRY
-            params["mkt"] = f"en-{TEMPEST_COUNTRY}"
-
-        headers = {
-            "User-Agent": IPAD_UA,
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-        }
-
-        try:
-            r = session.get(
-                TEMPEST_V1_SEARCH,
-                params=params,
-                headers=headers,
-                timeout=30,
-                allow_redirects=True,
-            )
-
-            if r.status_code != 200 or not r.content:
-                consecutive_failures += 1
-                time.sleep(0.2)
-                continue
-
-            data = r.json()
-            web_pages = data.get("webPages", {})
-            results = web_pages.get("value", [])
-
-            page_urls: set[str] = set()
-            for result in results:
-                url     = result.get("url", "")
-                snippet = result.get("snippet", "") + " " + result.get("name", "")
-                for text in [url, snippet]:
-                    page_urls.update(extract_shopify_urls(text))
-            page_urls.update(extract_shopify_urls(r.text))
-
-            if page_urls:
-                consecutive_failures = 0
-                new_urls = page_urls - found
-                if new_urls:
-                    found.update(new_urls)
-                    print(f"  [{i+1}/{num_searches}] +{len(new_urls)} new (total this cycle: {len(found)})")
-            else:
-                consecutive_failures += 1
-
-            time.sleep(random.uniform(0.1, 0.4))
-
-        except Exception:
-            consecutive_failures += 1
-            time.sleep(0.2)
-
-    return found
 
 
 # ── Main loop ───────────────────────────────────────────────────────
 def main():
     print("Scraper Worker starting")
-    print(f"  Country: {TEMPEST_COUNTRY or 'Worldwide'}")
+    print(f"  Engines: {', '.join(e['name'] for e in ENGINES)}")
     print(f"  Searches per cycle: {SEARCHES_PER_CYCLE}")
     print(f"  Batch size: {BATCH_SIZE}")
     print(f"  Cycle delay: {CYCLE_DELAY}s")
@@ -260,9 +233,7 @@ def main():
     conn = connect_db()
     print("Database connected")
     ensure_schema(conn)
-    print("Schema ready")
 
-    # Load already-known URLs into memory to avoid redundant inserts
     with conn.cursor() as cur:
         cur.execute("SELECT url FROM sites")
         seen: set[str] = {row[0] for row in cur.fetchall()}
@@ -274,18 +245,13 @@ def main():
 
     while True:
         cycle += 1
-
         stats = get_stats(conn)
-        print(
-            f"\n[Cycle {cycle}] DB: {stats['total']} total | "
-            f"{stats['pending']} pending | {stats['working']} working"
-        )
-        print(f"Starting Tempest scrape ({SEARCHES_PER_CYCLE} searches)...")
+        print(f"\n[Cycle {cycle}] DB: {stats['total']} total | {stats.get('pending',0)} pending | {stats.get('working',0)} working")
+        print(f"Starting scrape ({SEARCHES_PER_CYCLE} searches across {len(ENGINES)} engines)...")
 
-        found = scrape_tempest(SEARCHES_PER_CYCLE)
+        found = scrape_cycle(SEARCHES_PER_CYCLE)
         total_found += len(found)
 
-        # Filter out already-seen URLs before inserting
         new_urls = [u for u in found if u not in seen]
         seen.update(new_urls)
 
@@ -295,14 +261,12 @@ def main():
                 batch = new_urls[i:i + BATCH_SIZE]
                 n = insert_sites(conn, batch)
                 added += n
-                print(f"  Inserted batch {i//BATCH_SIZE + 1}: {n}/{len(batch)} new rows")
             total_added += added
             print(f"Cycle {cycle} done: {len(found)} found, {added} new in DB")
         else:
             print(f"Cycle {cycle} done: {len(found)} found, 0 new (all already in DB)")
 
-        print(f"Total across all cycles: {total_found} found, {total_added} added to DB")
-        print(f"Sleeping {CYCLE_DELAY}s...")
+        print(f"Totals: {total_found} found, {total_added} added | sleeping {CYCLE_DELAY}s...")
         time.sleep(CYCLE_DELAY)
 
 
