@@ -29,7 +29,7 @@ const proxyPath = "px.txt"
 
 // Our dashboard JSON API — returns {total, sites:[{url, checkout_price, ...}]}
 const workingSitesAPI = "https://charismatic-love-production.up.railway.app/api/sites"
-const maxSiteAmount = 5.0
+const maxSiteAmount = 10.0
 
 // ──────────────────────── CheckResult ─────────────────────────────────
 
