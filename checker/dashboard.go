@@ -35,7 +35,6 @@ func StartDashboard(addr string, db *DB) {
 	srv.ListenAndServe()
 }
 
-// handleAPISites serves all working sites as JSON including price info.
 func handleAPISites(db *DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := 1000
@@ -70,7 +69,6 @@ func handleAPISites(db *DB) http.HandlerFunc {
 	}
 }
 
-// handleDashboard renders an HTML table of all working sites.
 func handleDashboard(db *DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := 500
@@ -100,10 +98,11 @@ func handleDashboard(db *DB) http.HandlerFunc {
 			if s.Price == 0 {
 				priceStr = "—"
 			}
-			rows.WriteString(fmt.Sprintf(
-				`<tr><td>%d</td><td><a href="%s" target="_blank">%s</a></td><td class="price">%s</td><td>%s</td><td>%s</td></tr>`,
-				offset+i+1, s.URL, s.URL, priceStr, s.LastChecked, s.CreatedAt,
-			))
+			rows.WriteString("<tr><td>" + strconv.Itoa(offset+i+1) + "</td>" +
+				`<td><a href="` + s.URL + `" target="_blank">` + s.URL + "</a></td>" +
+				`<td class="price">` + priceStr + "</td>" +
+				"<td>" + s.LastChecked + "</td>" +
+				"<td>" + s.CreatedAt + "</td></tr>")
 		}
 
 		prevOffset := offset - limit
@@ -114,19 +113,28 @@ func handleDashboard(db *DB) http.HandlerFunc {
 
 		var pagination strings.Builder
 		if offset > 0 {
-			pagination.WriteString(fmt.Sprintf(`<a href="/?limit=%d&offset=%d">← Prev</a> `, limit, prevOffset))
+			pagination.WriteString(`<a href="/?limit=` + strconv.Itoa(limit) + `&offset=` + strconv.Itoa(prevOffset) + `">← Prev</a> `)
 		}
 		if nextOffset < total {
-			pagination.WriteString(fmt.Sprintf(`<a href="/?limit=%d&offset=%d">Next →</a>`, limit, nextOffset))
+			pagination.WriteString(`<a href="/?limit=` + strconv.Itoa(limit) + `&offset=` + strconv.Itoa(nextOffset) + `">Next →</a>`)
 		}
 
+		// Use strings.Replacer — safe with any content, never misparses % characters.
+		html := strings.NewReplacer(
+			"{PENDING}", strconv.Itoa(stats["pending"]),
+			"{CHECKING}", strconv.Itoa(stats["checking"]),
+			"{WORKING}", strconv.Itoa(stats["working"]),
+			"{DEAD}", strconv.Itoa(stats["dead"]),
+			"{ERROR}", strconv.Itoa(stats["error"]),
+			"{TOTAL}", strconv.Itoa(total),
+			"{FROM}", strconv.Itoa(offset+1),
+			"{TO}", strconv.Itoa(offset+len(sites)),
+			"{ROWS}", rows.String(),
+			"{PAGINATION}", pagination.String(),
+		).Replace(dashboardHTML)
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, dashboardHTML,
-			stats["pending"], stats["checking"], stats["working"], stats["dead"], stats["error"],
-			total, offset+1, offset+len(sites),
-			rows.String(),
-			pagination.String(),
-		)
+		w.Write([]byte(html))
 	}
 }
 
@@ -171,24 +179,24 @@ const dashboardHTML = `<!DOCTYPE html>
 <body>
 <header><h1>Site Checker Dashboard</h1></header>
 <div class="stats">
-  <div class="stat pending">  <div class="label">Pending</div>  <div class="value">%d</div></div>
-  <div class="stat checking"><div class="label">Checking</div><div class="value">%d</div></div>
-  <div class="stat working"> <div class="label">Working</div> <div class="value">%d</div></div>
-  <div class="stat dead">    <div class="label">Dead</div>    <div class="value">%d</div></div>
-  <div class="stat error">   <div class="label">Error</div>   <div class="value">%d</div></div>
+  <div class="stat pending">  <div class="label">Pending</div>  <div class="value">{PENDING}</div></div>
+  <div class="stat checking"><div class="label">Checking</div><div class="value">{CHECKING}</div></div>
+  <div class="stat working"> <div class="label">Working</div> <div class="value">{WORKING}</div></div>
+  <div class="stat dead">    <div class="label">Dead</div>    <div class="value">{DEAD}</div></div>
+  <div class="stat error">   <div class="label">Error</div>   <div class="value">{ERROR}</div></div>
 </div>
 <div class="table-wrap">
   <div class="table-header">
-    <h2>Working Sites — %d total (showing %d–%d)</h2>
-    <a class="api-link" href="/api/sites">/api/sites JSON ↗</a>
+    <h2>Working Sites &mdash; {TOTAL} total (showing {FROM}&ndash;{TO})</h2>
+    <a class="api-link" href="/api/sites">/api/sites JSON &#x2197;</a>
   </div>
   <table>
     <thead><tr>
       <th>#</th><th>URL</th><th>Cheapest Product</th><th>Last Checked</th><th>Discovered</th>
     </tr></thead>
-    <tbody>%s</tbody>
+    <tbody>{ROWS}</tbody>
   </table>
 </div>
-<div class="pagination">%s</div>
+<div class="pagination">{PAGINATION}</div>
 </body>
 </html>`

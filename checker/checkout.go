@@ -66,25 +66,40 @@ type Variant struct {
 // ──────────────────────── Step 0: find cheapest available product ────
 
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
-	// Fetch up to 250 products sorted cheapest-first — one request, no goroutines.
-	reqURL := fmt.Sprintf("%s/products.json?limit=250&sort_by=price-ascending", shopURL)
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("GET products.json: %w", err)
+	// Try sorted endpoint first; fall back to plain if store returns 404.
+	candidates := []string{
+		shopURL + "/products.json?limit=250&sort_by=price-ascending",
+		shopURL + "/products.json?limit=250",
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("reading products.json: %w", err)
+	var body []byte
+	for _, reqURL := range candidates {
+		r, reqErr := client.Get(reqURL)
+		if reqErr != nil {
+			return "", "", "", "", fmt.Errorf("GET products.json: %w", reqErr)
+		}
+		b, readErr := io.ReadAll(r.Body)
+		r.Body.Close()
+		if readErr != nil {
+			return "", "", "", "", fmt.Errorf("reading products.json: %w", readErr)
+		}
+		if r.StatusCode == http.StatusOK {
+			body = b
+			break
+		}
+		if r.StatusCode == http.StatusNotFound {
+			continue
+		}
+		return "", "", "", "", fmt.Errorf("products.json returned status %d", r.StatusCode)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("products.json returned status %d", resp.StatusCode)
+
+	if len(body) == 0 {
+		return "", "", "", "", fmt.Errorf("no products.json endpoint at %s", shopURL)
 	}
 
 	var data ProductsResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return "", "", "", "", fmt.Errorf("parsing products.json: %w", err)
+	if jsonErr := json.Unmarshal(body, &data); jsonErr != nil {
+		return "", "", "", "", fmt.Errorf("parsing products.json: %w", jsonErr)
 	}
 
 	bestPrice := math.MaxFloat64
@@ -110,7 +125,7 @@ func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productT
 	}
 
 	if !found {
-		return "", "", "", "", fmt.Errorf("no available products found at %s", shopURL)
+		return "", "", "", "", fmt.Errorf("no available products at %s", shopURL)
 	}
 	return productTitle, productID, variantID, priceStr, nil
 }
