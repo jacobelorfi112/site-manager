@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -67,115 +66,51 @@ type Variant struct {
 // ──────────────────────── Step 0: find cheapest available product ────
 
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
+	// Fetch up to 250 products sorted cheapest-first — one request, no goroutines.
+	reqURL := fmt.Sprintf("%s/products.json?limit=250&sort_by=price-ascending", shopURL)
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("GET products.json: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("reading products.json: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", fmt.Errorf("products.json returned status %d", resp.StatusCode)
+	}
+
+	var data ProductsResponse
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", "", "", "", fmt.Errorf("parsing products.json: %w", err)
+	}
+
 	bestPrice := math.MaxFloat64
 	found := false
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-	var doneFetching bool
-
-	// Provide up to 1000 pages to check (250,000 products)
-	pageChan := make(chan int, 1000)
-	for i := 1; i <= 1000; i++ {
-		pageChan <- i
-	}
-	close(pageChan)
-
-	// Spawn 10 concurrent workers for fast retrieval
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for pageNum := range pageChan {
-				mu.Lock()
-				stop := doneFetching
-				mu.Unlock()
-				if stop {
-					return
-				}
-
-				reqURL := fmt.Sprintf("%s/products.json?limit=250&page=%d", shopURL, pageNum)
-				resp, reqErr := client.Get(reqURL)
-				if reqErr != nil {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("GET %s: %w", reqURL, reqErr)
-					}
-					mu.Unlock()
-					continue
-				}
-
-				body, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if readErr != nil {
-					continue
-				}
-
-				if resp.StatusCode != http.StatusOK {
-					continue
-				}
-
-				var data ProductsResponse
-				if jsonErr := json.Unmarshal(body, &data); jsonErr != nil {
-					continue
-				}
-
-				if len(data.Products) == 0 {
-					// If we hit an empty page, there are no more products on further pages
-					mu.Lock()
-					doneFetching = true
-					mu.Unlock()
-					return
-				}
-
-				var localTitle, localPID, localVID, localPriceStr string
-				localBest := math.MaxFloat64
-				localFound := false
-
-				for _, p := range data.Products {
-					for _, v := range p.Variants {
-						if !v.Available {
-							continue
-						}
-						price, convErr := strconv.ParseFloat(v.Price, 64)
-						if convErr != nil {
-							continue
-						}
-						if price < localBest {
-							localBest = price
-							localTitle = p.Title
-							localPID = strconv.FormatInt(p.ID, 10)
-							localVID = strconv.FormatInt(v.ID, 10)
-							localPriceStr = v.Price
-							localFound = true
-						}
-					}
-				}
-
-				if localFound {
-					mu.Lock()
-					if localBest < bestPrice {
-						bestPrice = localBest
-						productTitle = localTitle
-						productID = localPID
-						variantID = localVID
-						priceStr = localPriceStr
-						found = true
-					}
-					mu.Unlock()
-				}
+	for _, p := range data.Products {
+		for _, v := range p.Variants {
+			if !v.Available {
+				continue
 			}
-		}()
+			price, convErr := strconv.ParseFloat(v.Price, 64)
+			if convErr != nil {
+				continue
+			}
+			if price < bestPrice {
+				bestPrice = price
+				productTitle = p.Title
+				productID = strconv.FormatInt(p.ID, 10)
+				variantID = strconv.FormatInt(v.ID, 10)
+				priceStr = v.Price
+				found = true
+			}
+		}
 	}
-
-	wg.Wait()
 
 	if !found {
-		if firstErr != nil {
-			return "", "", "", "", firstErr
-		}
-		return "", "", "", "", fmt.Errorf("no available products found at %s across pages", shopURL)
+		return "", "", "", "", fmt.Errorf("no available products found at %s", shopURL)
 	}
 	return productTitle, productID, variantID, priceStr, nil
 }
