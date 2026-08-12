@@ -1,3 +1,9 @@
+//go:build ignore
+// +build ignore
+
+// Standalone Telegram bot checker. Excluded from the server build.
+// Run directly with: go run botchecker.go
+
 package main
 
 import (

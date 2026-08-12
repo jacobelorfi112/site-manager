@@ -40,6 +40,9 @@ func RegisterSiteRoutes(mux *http.ServeMux, db *DB) {
 	mux.HandleFunc("/sites/recheck", func(w http.ResponseWriter, r *http.Request) {
 		handleRecheckAll(w, r, db)
 	})
+	mux.HandleFunc("/sites/upload", func(w http.ResponseWriter, r *http.Request) {
+		handleUploadSites(w, r, db)
+	})
 }
 
 func checkAuth(r *http.Request) bool {
@@ -109,6 +112,104 @@ func handleAddSites(w http.ResponseWriter, r *http.Request, db *DB) {
 		"added":    added,
 		"received": len(clean),
 	})
+}
+
+// POST /sites/upload — manually upload sites from the dashboard (no auth).
+// Accepts {"text": "url1\nurl2 ..."} or {"urls": ["url1","url2"]}.
+// Handles one-URL-per-line, comma-separated, and "URL | $price" export format.
+func handleUploadSites(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Text string   `json:"text"`
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"invalid JSON: %s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	var rawURLs []string
+	if req.Text != "" {
+		rawURLs = parseSiteText(req.Text)
+	} else {
+		rawURLs = req.URLs
+	}
+
+	clean := make([]string, 0, len(rawURLs))
+	skippedInvalid := 0
+	for _, u := range rawURLs {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		// Strip " | $price" suffix produced by /sites/export
+		if idx := strings.Index(u, " | "); idx > 0 {
+			u = strings.TrimSpace(u[:idx])
+		}
+		if !strings.Contains(u, "myshopify.com") {
+			skippedInvalid++
+			continue
+		}
+		if !strings.HasPrefix(u, "http") {
+			u = "https://" + u
+		}
+		clean = append(clean, u)
+	}
+
+	if len(clean) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"received":        len(rawURLs),
+			"valid":           0,
+			"added":           0,
+			"skipped_invalid": skippedInvalid,
+			"duplicates":      0,
+		})
+		return
+	}
+
+	added, err := db.AddSites(clean)
+	if err != nil {
+		log.Printf("Error uploading sites: %v", err)
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[api] Uploaded %d/%d new sites (skipped %d invalid)", added, len(clean), skippedInvalid)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"received":        len(rawURLs),
+		"valid":           len(clean),
+		"added":           added,
+		"skipped_invalid": skippedInvalid,
+		"duplicates":      len(clean) - added,
+	})
+}
+
+// parseSiteText splits raw pasted text into individual URL tokens.
+// Handles newlines, commas, and the "URL | $price" export format.
+func parseSiteText(text string) []string {
+	var urls []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if idx := strings.Index(line, " | "); idx > 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		for _, u := range strings.Split(line, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				urls = append(urls, u)
+			}
+		}
+	}
+	return urls
 }
 
 // GET /sites/working?limit=100&offset=0
@@ -298,6 +399,17 @@ a:hover{text-decoration:underline}
 .btn-del{background:#dc2626;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.8rem}
 .btn-del:hover{background:#b91c1c}
 h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
+.upload{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:24px}
+.upload textarea{width:100%;height:120px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem;resize:vertical}
+.upload textarea:focus{outline:none;border-color:#38bdf8}
+.upload-actions{display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap}
+.upload-actions input[type=file]{color:#94a3b8;font-size:.85rem}
+.btn-upload{background:#0ea5e9;color:#fff;border:none;border-radius:8px;padding:9px 18px;cursor:pointer;font-size:.9rem;font-weight:600}
+.btn-upload:hover{background:#0284c7}
+.btn-upload:disabled{background:#475569;cursor:not-allowed}
+#uploadResult{font-size:.85rem;color:#94a3b8}
+#uploadResult.ok{color:#4ade80}
+#uploadResult.err{color:#f87171}
 </style>
 </head>
 <body>
@@ -317,6 +429,16 @@ h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
 <div class="refresh">
 <a href="/sites/dashboard">↻ Refresh</a> &nbsp; <a href="/sites/export">⬇ Export TXT</a> &nbsp;
 <a href="#" onclick="recheckAll(); return false;" class="btn-recheck">🔄 Recheck All Sites</a>
+</div>`)
+
+	fmt.Fprint(w, `<h2>➕ Add Sites Manually</h2>
+<div class="upload">
+<textarea id="uploadText" placeholder="Paste Shopify store URLs here, one per line...&#10;https://store1.myshopify.com&#10;https://store2.myshopify.com&#10;&#10;Also accepts comma-separated or the 'URL | $price' export format"></textarea>
+<div class="upload-actions">
+<input type="file" id="uploadFile" accept=".txt" />
+<button class="btn-upload" id="btnUpload" onclick="uploadSites()">Upload Sites</button>
+<span id="uploadResult"></span>
+</div>
 </div>`)
 
 	fmt.Fprintf(w, `<h2>Working Sites (%d)</h2>`, workingTotal)
@@ -351,10 +473,50 @@ function recheckAll() {
 	if (!confirm('Reset ALL sites back to pending for re-checking?')) return;
 	fetch('/sites/recheck', {method:'POST'})
 		.then(r => r.json())
-		.then(d => { alert('Deleted ' + d.deleted + ' dead/error sites, reset ' + d.reset + ' to pending'); location.reload(); })
+		.then(d => { alert('Reset ' + d.reset + ' sites to pending'); location.reload(); })
 		.catch(() => alert('Error'));
 }
-setTimeout(()=>location.reload(),30000);
+function uploadSites() {
+	var text = document.getElementById('uploadText').value.trim();
+	if (!text) { alert('Paste some URLs first'); return; }
+	var btn = document.getElementById('btnUpload');
+	var result = document.getElementById('uploadResult');
+	btn.disabled = true;
+	btn.textContent = 'Uploading...';
+	result.className = '';
+	result.textContent = '';
+	fetch('/sites/upload', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text})})
+		.then(function(r){ return r.json(); })
+		.then(function(d){
+			btn.disabled = false;
+			btn.textContent = 'Upload Sites';
+			if (d.error) { result.className = 'err'; result.textContent = 'Error: ' + d.error; return; }
+			result.className = 'ok';
+			result.textContent = '✓ Added ' + d.added + ' new | ' + d.duplicates + ' duplicates | ' + d.skipped_invalid + ' invalid';
+			if (d.added > 0) { setTimeout(function(){ location.reload(); }, 2500); }
+		})
+		.catch(function(){
+			btn.disabled = false;
+			btn.textContent = 'Upload Sites';
+			result.className = 'err';
+			result.textContent = 'Network error';
+		});
+}
+document.getElementById('uploadFile').addEventListener('change', function(e){
+	var file = e.target.files[0];
+	if (!file) return;
+	var reader = new FileReader();
+	reader.onload = function(ev){ document.getElementById('uploadText').value = ev.target.result; };
+	reader.readAsText(file);
+});
+// Auto-refresh, but never wipe an in-progress upload
+setInterval(function(){
+	var ta = document.getElementById('uploadText');
+	var res = document.getElementById('uploadResult');
+	if (ta && ta.value.trim() !== '') return;
+	if (res && res.className === 'ok') return;
+	location.reload();
+}, 30000);
 </script>
 </body></html>`)
 }

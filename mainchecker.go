@@ -1,3 +1,9 @@
+//go:build ignore
+// +build ignore
+
+// Standalone HTTP/TLS card-checker tool. Excluded from the server build.
+// Run directly with: go run mainchecker.go
+
 package main
 
 import (
