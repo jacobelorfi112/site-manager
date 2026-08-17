@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -20,7 +21,7 @@ type SiteCheckWorker struct {
 // NewSiteCheckWorker creates a background worker.
 func NewSiteCheckWorker(db *DB, batchSize int) *SiteCheckWorker {
 	if batchSize <= 0 {
-		batchSize = 3
+		batchSize = 20
 	}
 	return &SiteCheckWorker{db: db, batchSize: batchSize}
 }
@@ -34,7 +35,7 @@ func (w *SiteCheckWorker) Run(stop <-chan struct{}) {
 		log.Printf("[worker] Reset %d stuck sites back to pending", n)
 	}
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -98,13 +99,30 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 		if res != nil && res.StatusCode != "" {
 			errMsg = res.StatusCode + ": " + errMsg
 		}
-		log.Printf("[worker] %s → ERROR: %s", storeURL, errMsg)
-		w.db.DeleteSite(site.ID)
+		// Definitive dead store — mark dead, never retry.
+		if errors.Is(err, errDeadStore) {
+			log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
+			w.db.UpdateSiteResult(site.ID, StatusDead, "DEAD_STORE", errMsg, 0)
+			return
+		}
+		// Retryable (402/429, Cloudflare, incompatible, transient) → error, will retry up to 3x.
+		if res != nil && res.Retryable {
+			code := res.StatusCode
+			if code == "" {
+				code = "RETRYABLE"
+			}
+			log.Printf("[worker] RETRYABLE: %s (%s)", storeURL, errMsg)
+			w.db.UpdateSiteResult(site.ID, StatusError, code, errMsg, 0)
+			return
+		}
+		// Definitive failure — dead.
+		log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
+		w.db.UpdateSiteResult(site.ID, StatusDead, "CHECK_FAILED", errMsg, 0)
 		return
 	}
 	if res == nil {
-		log.Printf("[worker] %s → ERROR: nil result", storeURL)
-		w.db.DeleteSite(site.ID)
+		log.Printf("[worker] ERROR: %s (nil result)", storeURL)
+		w.db.UpdateSiteResult(site.ID, StatusError, "NIL_RESULT", "nil result from checkout", 0)
 		return
 	}
 
@@ -128,8 +146,8 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 	if errMsg == "" {
 		errMsg = "unknown"
 	}
-	log.Printf("[worker] REMOVING: %s (%s)", storeURL, errMsg)
-	w.db.DeleteSite(site.ID)
+	log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
+	w.db.UpdateSiteResult(site.ID, StatusDead, "CHECK_FAILED", errMsg, 0)
 }
 
 // parseAmountString extracts a float amount from a currency-prefixed string
