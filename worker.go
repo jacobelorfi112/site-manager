@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -94,28 +93,33 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 	}()
 
 	res, err := runCheckoutForCard(storeURL, testCardEntry, "")
+	if res != nil {
+		price := parseAmountString(res.Amount)
+
+		// Card decision reached (declined / approved / charged / brand rejected) →
+		// the checkout pipeline works end-to-end → site is WORKING. bo-main
+		// returns declined results together with an error, so this must be
+		// checked before err.
+		if res.Status == BoDeclined || res.Status == BoApproved || res.Status == BoCharged ||
+			res.StatusCode == "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" {
+			log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
+			w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("checkout works (%s)", res.StatusCode), price)
+			return
+		}
+	}
+
 	if err != nil {
 		errMsg := err.Error()
 		if res != nil && res.StatusCode != "" {
 			errMsg = res.StatusCode + ": " + errMsg
 		}
-		// Definitive dead store — mark dead, never retry.
-		if errors.Is(err, errDeadStore) {
-			log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
-			w.db.UpdateSiteResult(site.ID, StatusDead, "DEAD_STORE", errMsg, 0)
-			return
-		}
-		// Retryable (402/429, Cloudflare, incompatible, transient) → error, will retry up to 3x.
-		if res != nil && res.Retryable {
-			code := res.StatusCode
-			if code == "" {
-				code = "RETRYABLE"
-			}
+		// Genuine transient network errors → error status, will retry.
+		if isTransientErr(err) {
 			log.Printf("[worker] RETRYABLE: %s (%s)", storeURL, errMsg)
-			w.db.UpdateSiteResult(site.ID, StatusError, code, errMsg, 0)
+			w.db.UpdateSiteResult(site.ID, StatusError, "TRANSIENT", errMsg, 0)
 			return
 		}
-		// Definitive failure — dead.
+		// Everything else is a permanent site condition → dead.
 		log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
 		w.db.UpdateSiteResult(site.ID, StatusDead, "CHECK_FAILED", errMsg, 0)
 		return

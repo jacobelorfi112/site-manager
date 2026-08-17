@@ -51,7 +51,7 @@ func main() {
 	defer browser.Close()
 
 	// Worker batch size
-	batchSize := 3
+	batchSize := 20
 	if v := os.Getenv("WORKER_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			batchSize = n
