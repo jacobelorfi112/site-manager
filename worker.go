@@ -3,10 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // SiteCheckWorker continuously pulls pending sites from the DB and runs
@@ -14,26 +14,15 @@ import (
 // the checkout flow works → site is marked working.
 type SiteCheckWorker struct {
 	db        *DB
-	browser   *Browser
 	batchSize int
 }
 
-// Test card used for site validation — triggers INCORRECT_NUMBER if checkout works.
-var workerTestCard = CardInfo{
-	Raw:    "5524860214037312|10|28|950",
-	Number: "5524 8602 1403 7312",
-	ExpMM:  "10",
-	ExpYY:  "28",
-	CVV:    "950",
-	Last4:  "7312",
-}
-
 // NewSiteCheckWorker creates a background worker.
-func NewSiteCheckWorker(db *DB, browser *Browser, batchSize int) *SiteCheckWorker {
+func NewSiteCheckWorker(db *DB, batchSize int) *SiteCheckWorker {
 	if batchSize <= 0 {
 		batchSize = 3
 	}
-	return &SiteCheckWorker{db: db, browser: browser, batchSize: batchSize}
+	return &SiteCheckWorker{db: db, batchSize: batchSize}
 }
 
 // Run starts the worker loop. Call in a goroutine.
@@ -87,24 +76,15 @@ func (w *SiteCheckWorker) processBatch() {
 	wg.Wait()
 }
 
-// checkSite runs a full checkout with a test card via the browser.
-// INCORRECT_NUMBER means the checkout flow works end-to-end → site is working.
+// checkSite runs bo-main's TLS Shopify checkout against the site with a test
+// card (proxyless). If the checkout gets far enough to reject the card
+// (BoDeclined), the full pipeline works → site is working. Dead/broken sites
+// are removed.
 func (w *SiteCheckWorker) checkSite(site Site) {
 	storeURL := site.URL
-	buyer := DefaultBuyer()
+	// Fake card — triggers a card decision (BoDeclined) only if the checkout works.
+	const testCardEntry = "5524860214037312|10|28|950"
 
-	entry := CardEntry{
-		Card:  workerTestCard,
-		Store: storeURL,
-		Index: 0,
-	}
-	entry.Card.FullName = buyer.FirstName + " " + buyer.LastName
-
-	// Acquire a tab slot
-	w.browser.tabSem <- struct{}{}
-	defer func() { <-w.browser.tabSem }()
-
-	// Recover from panics
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[worker] PANIC checking %s: %v", storeURL, r)
@@ -112,33 +92,65 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 		}
 	}()
 
-	// Open a new tab
-	page, err := w.browser.browser.Page(proto.TargetCreateTarget{URL: ""})
+	res, err := runCheckoutForCard(storeURL, testCardEntry, "")
 	if err != nil {
-		log.Printf("[worker] Tab create failed for %s: %v", storeURL, err)
-		w.db.UpdateSiteResult(site.ID, StatusError, "TAB_CREATE_FAILED", err.Error(), 0)
+		errMsg := err.Error()
+		if res != nil && res.StatusCode != "" {
+			errMsg = res.StatusCode + ": " + errMsg
+		}
+		log.Printf("[worker] %s → ERROR: %s", storeURL, errMsg)
+		w.db.DeleteSite(site.ID)
 		return
 	}
-	defer page.Close()
-	page = page.Timeout(180 * time.Second)
+	if res == nil {
+		log.Printf("[worker] %s → ERROR: nil result", storeURL)
+		w.db.DeleteSite(site.ID)
+		return
+	}
 
-	// Run the full checkout
-	result := runCheckout(page, entry, buyer)
-	log.Printf("[worker] %s → %s (%s) in %.1fs", storeURL, result.Status, result.ErrorCode, result.ElapsedSeconds)
+	price := parseAmountString(res.Amount)
 
-	// INCORRECT_NUMBER or CARD_DECLINED = checkout flow works, site is valid
-	if result.ErrorCode == "INCORRECT_NUMBER" || result.ErrorCode == "CARD_DECLINED" {
-		price := result.CheckoutPrice
-		log.Printf("[worker] WORKING: %s ($%.2f)", storeURL, price)
+	// BoDeclined = card rejected at payment → checkout pipeline works → site valid.
+	if res.Status == BoDeclined {
+		log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
 		w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("full checkout works ($%.2f)", price), price)
 		return
 	}
 
-	// Site is not working — delete it
-	errMsg := result.ErrorCode
-	if result.ErrorMessage != "" {
-		errMsg = result.ErrorMessage
+	// BoApproved (3DS) / BoCharged (order placed) also prove the pipeline works.
+	if res.Status == BoApproved || res.Status == BoCharged {
+		log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
+		w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("checkout works (%s)", res.StatusCode), price)
+		return
+	}
+
+	errMsg := res.StatusCode
+	if errMsg == "" {
+		errMsg = "unknown"
 	}
 	log.Printf("[worker] REMOVING: %s (%s)", storeURL, errMsg)
 	w.db.DeleteSite(site.ID)
+}
+
+// parseAmountString extracts a float amount from a currency-prefixed string
+// like "$12.34", "12.34", or "USD 12.34".
+func parseAmountString(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	s = strings.TrimLeft(s, "$€£¥")
+	num := ""
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || r == '.' || r == '-' {
+			num += string(r)
+		} else if num != "" {
+			break
+		}
+	}
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0
+	}
+	return f
 }

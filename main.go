@@ -61,7 +61,7 @@ func main() {
 	// Start background site check worker if DB is available
 	stopWorker := make(chan struct{})
 	if db != nil {
-		worker := NewSiteCheckWorker(db, browser, batchSize)
+		worker := NewSiteCheckWorker(db, batchSize)
 		go worker.Run(stopWorker)
 		fmt.Println("Site check worker started")
 	}
