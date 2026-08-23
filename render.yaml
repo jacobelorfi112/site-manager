@@ -1,0 +1,47 @@
+# Render Blueprint — site-manager (Go) + scraper (Python) + Postgres
+# Docs: https://render.com/docs/blueprint-spec
+
+databases:
+  - name: site-db
+    plan: free
+    ipAllowList: []   # allow all (services connect internally)
+
+services:
+  # ── Go site-manager: dashboard, /check API, background site-check worker ──
+  - type: web
+    name: site-manager
+    env: docker
+    region: oregon
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: site-db
+          property: connectionString
+      - key: WORKER_BATCH_SIZE
+        value: "20"
+      - key: MAX_TABS
+        value: "3"
+      - key: CHROME_POOL_SIZE
+        value: "3"
+
+  # ── Python scraper: dork-based Shopify discovery → writes to Postgres ──
+  - type: worker
+    name: scraper
+    env: docker
+    region: oregon
+    plan: free
+    dockerfilePath: ./scraper/Dockerfile
+    dockerContext: ./scraper
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: site-db
+          property: connectionString
+      - key: SCRAPER_CYCLE_DELAY
+        value: "10"
