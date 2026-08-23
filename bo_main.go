@@ -274,107 +274,122 @@ func findCheapestProductViaGraphQL(client tls_client.HttpClient, shopURL string)
 	bestPrice := math.MaxFloat64
 	found := false
 
-	// Storefront API schema: products(first:N) → edges → node → variants.
-	// Returns gid://shopify/Product/<id> and gid://shopify/ProductVariant/<id>.
-	// We strip the gid:// prefix to match what /cart/add.js expects (numeric IDs).
-	// NOTE: brace balance is critical — extra `}` triggers
-	// "Expected one of SCHEMA, SCALAR, TYPE... actual: RCURLY" parse error.
-	// `quantityAvailable` requires unauthenticated_read_product_inventory scope
-	// which most shops don't grant — we filter by `availableForSale` instead.
-	query := `{"query":"{ products(first:250) { edges { node { id title availableForSale variants(first:10) { edges { node { id title priceV2 { amount currencyCode } } } } } } } }"}`
+	// Storefront API caps products(first:N) at 250 per request.
+	// Paginate via cursor to cover large catalogs (up to 10 pages = 2500 products).
+	const maxGQLPages = 10
+	var cursor string
 
-	req, reqErr := fhttp.NewRequest("POST", shopURL+"/api/graphql", strings.NewReader(query))
-	if reqErr != nil {
-		return "", "", "", "", fmt.Errorf("building graphql request: %w", reqErr)
-	}
-	req.Header.Set("accept", "application/json")
-	req.Header.Set("accept-language", "en-US,en;q=0.9")
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("origin", shopURL)
-	req.Header.Set("referer", shopURL+"/")
-	req.Header.Set("sec-ch-ua", randomSecChUA())
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-	req.Header.Set("sec-fetch-dest", "empty")
-	req.Header.Set("sec-fetch-mode", "cors")
-	req.Header.Set("sec-fetch-site", "same-origin")
-	req.Header.Set("user-agent", randomChromeUA())
-
-	resp, doErr := doWithRetry(client, req, 2)
-	if doErr != nil {
-		return "", "", "", "", fmt.Errorf("POST /api/graphql: %w", doErr)
-	}
-	defer resp.Body.Close()
-
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return "", "", "", "", fmt.Errorf("reading graphql response: %w", readErr)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("POST /api/graphql returned status %d", resp.StatusCode)
-	}
-
-	bodyStr := string(body)
-	// Detect error payload — gql errors come back as 200 with an `errors` array.
-	if strings.Contains(bodyStr, `"errors"`) {
-		return "", "", "", "", fmt.Errorf("graphql errors: %s", truncateForLog(bodyStr, 300))
-	}
-
-	// Parse with encoding/json — far more robust than regex on nested GraphQL.
-	var gqlResp struct {
-		Data struct {
-			Products struct {
-				Edges []struct {
-					Node struct {
-						ID              string `json:"id"`
-						Title           string `json:"title"`
-						AvailableForSale bool  `json:"availableForSale"`
-						Variants struct {
-							Edges []struct {
-								Node struct {
-									ID     string `json:"id"`
-									Title  string `json:"title"`
-									PriceV2 struct {
-										Amount     string `json:"amount"`
-										CurrencyCode string `json:"currencyCode"`
-									} `json:"priceV2"`
-								} `json:"node"`
-							} `json:"edges"`
-						} `json:"variants"`
-					} `json:"node"`
-				} `json:"edges"`
-			} `json:"products"`
-		} `json:"data"`
-	}
-	if jErr := json.Unmarshal(body, &gqlResp); jErr != nil {
-		return "", "", "", "", fmt.Errorf("graphql parse: %w (body: %s)", jErr, truncateForLog(bodyStr, 200))
-	}
-
-	for _, edge := range gqlResp.Data.Products.Edges {
-		p := edge.Node
-		if !p.AvailableForSale {
-			continue
+	for pageNum := 1; pageNum <= maxGQLPages; pageNum++ {
+		// Build query with cursor if we have one.
+		afterClause := ""
+		if cursor != "" {
+			afterClause = fmt.Sprintf(`, after:"%s"`, cursor)
 		}
-		pidGID := p.ID
-		pidTitle := p.Title
-		for _, ve := range p.Variants.Edges {
-			v := ve.Node
-			vidGID := v.ID
-			priceVal := v.PriceV2.Amount
-			price, convErr := strconv.ParseFloat(priceVal, 64)
-			if convErr != nil || price <= 0 {
+		query := fmt.Sprintf(`{"query":"{ products(first:250%s) { pageInfo { hasNextPage endCursor } edges { cursor node { id title availableForSale variants(first:10) { edges { node { id title priceV2 { amount currencyCode } } } } } } } }"}`, afterClause)
+
+		req, reqErr := fhttp.NewRequest("POST", shopURL+"/api/graphql", strings.NewReader(query))
+		if reqErr != nil {
+			return "", "", "", "", fmt.Errorf("building graphql request: %w", reqErr)
+		}
+		req.Header.Set("accept", "application/json")
+		req.Header.Set("accept-language", "en-US,en;q=0.9")
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("origin", shopURL)
+		req.Header.Set("referer", shopURL+"/")
+		req.Header.Set("sec-ch-ua", randomSecChUA())
+		req.Header.Set("sec-ch-ua-mobile", "?0")
+		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		req.Header.Set("sec-fetch-dest", "empty")
+		req.Header.Set("sec-fetch-mode", "cors")
+		req.Header.Set("sec-fetch-site", "same-origin")
+		req.Header.Set("user-agent", randomChromeUA())
+
+		resp, doErr := doWithRetry(client, req, 2)
+		if doErr != nil {
+			return "", "", "", "", fmt.Errorf("POST /api/graphql: %w", doErr)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return "", "", "", "", fmt.Errorf("reading graphql response: %w", readErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", "", "", "", fmt.Errorf("POST /api/graphql returned status %d", resp.StatusCode)
+		}
+
+		bodyStr := string(body)
+		if strings.Contains(bodyStr, `"errors"`) {
+			return "", "", "", "", fmt.Errorf("graphql errors: %s", truncateForLog(bodyStr, 300))
+		}
+
+		var gqlResp struct {
+			Data struct {
+				Products struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Edges []struct {
+						Cursor string `json:"cursor"`
+						Node  struct {
+							ID               string `json:"id"`
+							Title            string `json:"title"`
+							AvailableForSale bool   `json:"availableForSale"`
+							Variants         struct {
+								Edges []struct {
+									Node struct {
+										ID     string `json:"id"`
+										Title  string `json:"title"`
+										PriceV2 struct {
+											Amount       string `json:"amount"`
+											CurrencyCode string `json:"currencyCode"`
+										} `json:"priceV2"`
+									} `json:"node"`
+								} `json:"edges"`
+							} `json:"variants"`
+						} `json:"node"`
+					} `json:"edges"`
+				} `json:"products"`
+			} `json:"data"`
+		}
+		if jErr := json.Unmarshal(body, &gqlResp); jErr != nil {
+			return "", "", "", "", fmt.Errorf("graphql parse: %w (body: %s)", jErr, truncateForLog(bodyStr, 200))
+		}
+
+		productCount := 0
+		for _, edge := range gqlResp.Data.Products.Edges {
+			p := edge.Node
+			if !p.AvailableForSale {
 				continue
 			}
-			if price < bestPrice {
-				bestPrice = price
-				// Strip gid://shopify/ProductVariant/<id> → numeric id
-				variantID = stripGID(vidGID)
-				productID = stripGID(pidGID)
-				productTitle = pidTitle
-				priceStr = priceVal
-				found = true
+			pidGID := p.ID
+			pidTitle := p.Title
+			for _, ve := range p.Variants.Edges {
+				v := ve.Node
+				vidGID := v.ID
+				priceVal := v.PriceV2.Amount
+				price, convErr := strconv.ParseFloat(priceVal, 64)
+				if convErr != nil || price <= 0 {
+					continue
+				}
+				if price < bestPrice {
+					bestPrice = price
+					variantID = stripGID(vidGID)
+					productID = stripGID(pidGID)
+					productTitle = pidTitle
+					priceStr = priceVal
+					found = true
+				}
 			}
+			productCount++
 		}
+
+		// Stop if no more pages.
+		if !gqlResp.Data.Products.PageInfo.HasNextPage || gqlResp.Data.Products.PageInfo.EndCursor == "" {
+			break
+		}
+		cursor = gqlResp.Data.Products.PageInfo.EndCursor
 	}
 
 	if !found {
