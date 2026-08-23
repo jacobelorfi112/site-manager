@@ -280,10 +280,10 @@ func findCheapestProductViaGraphQL(client tls_client.HttpClient, shopURL string)
 	var cursor string
 
 	for pageNum := 1; pageNum <= maxGQLPages; pageNum++ {
-		// Build query with cursor if we have one.
+		// Build query with cursor if we have one (escape quotes for JSON string).
 		afterClause := ""
 		if cursor != "" {
-			afterClause = fmt.Sprintf(`, after:"%s"`, cursor)
+			afterClause = fmt.Sprintf(`, after:\"%s\"`, cursor)
 		}
 		query := fmt.Sprintf(`{"query":"{ products(first:250%s) { pageInfo { hasNextPage endCursor } edges { cursor node { id title availableForSale variants(first:10) { edges { node { id title priceV2 { amount currencyCode } } } } } } } }"}`, afterClause)
 
