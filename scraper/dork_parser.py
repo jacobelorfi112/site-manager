@@ -186,7 +186,7 @@ ENGINE_LABELS = {'bing': 'Bing', 'duckduckgo': 'DuckDuckGo', 'brave': 'Brave'}
 SHOPIFY_DORKS_FILE = 'shopify_dorks.txt'
 SHOPIFY_HOST_SUFFIX = '.myshopify.com'
 SHOPIFY_DELAY = 3.0  # seconds between dorks (avoid burning rate limits)
-MAX_PAGES = int(os.environ.get('MAX_PAGES', '3'))  # pages per dork per engine
+MAX_PAGES = int(os.environ.get('MAX_PAGES', '0'))  # 0 = unlimited (keep going until no results)
 
 
 def fetch_engine(engine, dork, page=1):
@@ -252,31 +252,37 @@ def run_shopify_dork(dork):
     got = {e: [] for e in ENGINE_KEYS + ['brave']}
     parts = []
 
-    # Bing: try up to MAX_PAGES pages
+    # Bing: keep fetching pages until no results (or MAX_PAGES if set)
     bing_urls = []
-    for page in range(1, MAX_PAGES + 1):
+    page = 1
+    while True:
         urls, status = run_engine_quick('bing', dork, page=page)
         if status == 'OK' and urls:
             bing_urls.extend(urls)
         else:
             break
-        if page < MAX_PAGES:
-            time.sleep(1)
+        if MAX_PAGES and page >= MAX_PAGES:
+            break
+        page += 1
+        time.sleep(1)
     got['bing'] = _shopify_kept(bing_urls)
     parts.append('Bing:%s(%d)' % ('OK' if bing_urls else '0', len(got['bing'])))
 
-    # Brave: try up to MAX_PAGES pages (if Bing found nothing or as supplement)
+    # Brave: keep fetching pages until no results (or MAX_PAGES if set)
     if not any(got.values()) and CURL_OK:
         brave_urls = []
-        for page in range(1, MAX_PAGES + 1):
+        page = 1
+        while True:
             urls, status = fetch_brave(dork, page=page)
             if status == 'OK' and urls:
                 brave_urls.extend(urls)
             else:
                 parts.append('Brave:%s(%d)' % (status, 0))
                 break
-            if page < MAX_PAGES:
-                time.sleep(1)
+            if MAX_PAGES and page >= MAX_PAGES:
+                break
+            page += 1
+            time.sleep(1)
         got['brave'] = _shopify_kept(brave_urls)
         if brave_urls:
             parts.append('Brave:OK(%d)' % len(got['brave']))
