@@ -168,7 +168,7 @@ def fetch_brave(dork, page=1):
         if r.status_code == 200:
             return parse_brave(r.text), 'OK'
         if r.status_code == 429:
-            _brave_cooldown = 30  # skip Brave for the next 30 dorks
+            _brave_cooldown = 60  # skip Brave for the next 60 dorks
             return [], '429'
         return [], 'HTTP %d' % r.status_code
     except Exception as e:
@@ -185,7 +185,7 @@ ENGINE_LABELS = {'bing': 'Bing', 'duckduckgo': 'DuckDuckGo', 'brave': 'Brave'}
 
 SHOPIFY_DORKS_FILE = 'shopify_dorks.txt'
 SHOPIFY_HOST_SUFFIX = '.myshopify.com'
-SHOPIFY_DELAY = 3.0  # seconds between dorks (avoid burning rate limits)
+SHOPIFY_DELAY = float(os.environ.get('SHOPIFY_DELAY', '1.0'))  # seconds between dorks
 MAX_PAGES = int(os.environ.get('MAX_PAGES', '0'))  # 0 = unlimited (keep going until no results)
 
 
@@ -252,13 +252,19 @@ def run_shopify_dork(dork):
     got = {e: [] for e in ENGINE_KEYS + ['brave']}
     parts = []
 
-    # Bing: keep fetching pages until no results (or MAX_PAGES if set)
+    # Bing: keep fetching pages until no SHOPIFY results (or MAX_PAGES if set).
+    # Key fix: check Shopify URLs PER PAGE, not raw URLs. If page 1 has 0
+    # Shopify stores, stop — don't paginate through 15 pages of non-Shopify junk.
     bing_urls = []
     page = 1
     while True:
         urls, status = run_engine_quick('bing', dork, page=page)
-        if status == 'OK' and urls:
-            bing_urls.extend(urls)
+        if status == 'OK':
+            kept = _shopify_kept(urls)
+            if kept:
+                bing_urls.extend(urls)
+            else:
+                break  # no Shopify URLs on this page → stop
         else:
             break
         if MAX_PAGES and page >= MAX_PAGES:
@@ -287,8 +293,10 @@ def run_shopify_dork(dork):
         if brave_urls:
             parts.append('Brave:OK(%d)' % len(got['brave']))
 
-    # DDG fallback (single page — DDG HTML doesn't support easy pagination)
-    if not any(got.values()):
+    # DDG fallback — DISABLED. DDG html endpoint consistently times out
+    # (15s wasted per dork). Bing + Brave cover all sources. Re-enable with
+    # env var USE_DDG=1 if needed.
+    if not any(got.values()) and os.environ.get('USE_DDG', '0') == '1':
         urls, status = run_engine_quick('duckduckgo', dork)
         got['duckduckgo'] = _shopify_kept(urls)
         parts.append('DDG:%s(%d)' % (status, len(got['duckduckgo'])))
