@@ -141,6 +141,56 @@ BRAVE_PROFILES = ['chrome110', 'chrome116', 'chrome120', 'edge101', 'safari15_5'
 _brave_idx = 0
 _brave_cooldown = 0  # when > 0, skip Brave (429 cooldown counter)
 
+# ── Proxy pool (from proxy-manager API) ─────────────────────────────
+PROXY_API_URL = os.environ.get('PROXY_API_URL', 'https://proxy-manager-t69d.onrender.com/proxies?limit=1000')
+_proxy_pool = []
+_proxy_idx = 0
+_proxy_bad = set()
+_proxy_last_refresh = 0
+PROXY_REFRESH_INTERVAL = 1800  # refresh proxy list every 30 min
+
+
+def fetch_proxies():
+    """Fetch proxies from proxy-manager API."""
+    global _proxy_pool, _proxy_bad, _proxy_last_refresh
+    try:
+        r = curl_requests.get(PROXY_API_URL, timeout=20)
+        if r.status_code == 200:
+            proxies = [l.strip() for l in r.text.strip().split('\n') if l.strip()]
+            _proxy_pool = proxies
+            _proxy_bad = set()
+            _proxy_last_refresh = time.time()
+            print(f'[proxy] loaded {len(proxies)} proxies from API', flush=True)
+            return True
+    except Exception as e:
+        print(f'[proxy] failed to fetch: {e}', flush=True)
+    return False
+
+
+def get_next_proxy():
+    """Get next good proxy from pool (round-robin, skip bad ones)."""
+    global _proxy_idx, _proxy_pool, _proxy_last_refresh
+    if not _proxy_pool or (time.time() - _proxy_last_refresh > PROXY_REFRESH_INTERVAL):
+        fetch_proxies()
+    if not _proxy_pool:
+        return None
+    good = [p for p in _proxy_pool if p not in _proxy_bad]
+    if not good:
+        # All proxies bad — refresh and retry once
+        _proxy_bad.clear()
+        if fetch_proxies():
+            good = list(_proxy_pool)
+    if not good:
+        return None
+    proxy = good[_proxy_idx % len(good)]
+    _proxy_idx += 1
+    return proxy
+
+
+def mark_proxy_bad(proxy):
+    """Mark a proxy as bad (dead/timeout)."""
+    _proxy_bad.add(proxy)
+
 
 def parse_brave(html):
     """Extract result URLs from a Brave results page."""
@@ -153,26 +203,44 @@ def parse_brave(html):
 
 
 def fetch_brave(dork, page=1):
-    """Brave via curl_cffi browser impersonation; rotate profiles + 429 backoff."""
+    """Brave via curl_cffi with proxy rotation. No cooldown — just rotate proxy on 429."""
     global _brave_idx, _brave_cooldown
-    if _brave_cooldown > 0:
-        _brave_cooldown -= 1
-        return [], 'cooldown'
     url = 'https://search.brave.com/search?q=' + up.quote(dork) + '&source=web'
     if page > 1:
         url += '&offset=%d' % ((page - 1) * 20)
     prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
     _brave_idx += 1
-    try:
-        r = curl_requests.get(url, impersonate=prof, timeout=15)
-        if r.status_code == 200:
-            return parse_brave(r.text), 'OK'
-        if r.status_code == 429:
-            _brave_cooldown = 60  # skip Brave for the next 60 dorks
-            return [], '429'
-        return [], 'HTTP %d' % r.status_code
-    except Exception as e:
-        return [], '%s' % e.__class__.__name__
+
+    # Try up to 3 proxies before giving up on this dork
+    for attempt in range(3):
+        proxy = get_next_proxy()
+        if not proxy:
+            # No proxies — try direct (no proxy) as last resort
+            try:
+                r = curl_requests.get(url, impersonate=prof, timeout=15)
+                if r.status_code == 200:
+                    return parse_brave(r.text), 'OK'
+                if r.status_code == 429:
+                    _brave_cooldown = 60
+                    return [], '429-noproxy'
+                return [], 'HTTP %d' % r.status_code
+            except Exception as e:
+                return '', '%s' % e.__class__.__name__
+
+        proxies_dict = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
+        try:
+            r = curl_requests.get(url, impersonate=prof, timeout=15, proxies=proxies_dict)
+            if r.status_code == 200:
+                return parse_brave(r.text), 'OK'
+            if r.status_code == 429:
+                mark_proxy_bad(proxy)
+                continue  # rotate to next proxy immediately
+            return [], 'HTTP %d' % r.status_code
+        except Exception:
+            mark_proxy_bad(proxy)
+            continue  # try next proxy
+
+    return [], '429-allproxies'
 
 
 PARSERS = {
