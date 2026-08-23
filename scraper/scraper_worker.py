@@ -119,27 +119,43 @@ def main():
         print(f"[Cycle {cycle}] Running {len(dorks)} dorks...", flush=True)
 
         found = set()
+        batch = set()
+        added_total = 0
         t0 = time.time()
 
         for di, dork in enumerate(dorks, 1):
             try:
                 kept_by_engine, status_str = run_shopify_dork(dork)
+                new = 0
                 for eng, urls in kept_by_engine.items():
                     for u in urls:
                         store_url = normalize_store_url(u)
-                        if store_url:
+                        if store_url and store_url not in found:
                             found.add(store_url)
-                print(f"  [{di}/{len(dorks)}] {dork[:55]:<55} {status_str}", flush=True)
+                            batch.add(store_url)
+                            new += 1
+                print(f"  [{di}/{len(dorks)}] {dork[:55]:<55} {status_str}  +{new}", flush=True)
             except Exception as e:
                 print(f"  [{di}/{len(dorks)}] {dork[:55]:<55} ERROR: {e}", flush=True)
 
+            # Insert in batches during the cycle (every 50 dorks or 100 new URLs)
+            if len(batch) >= 100 or (di % 50 == 0 and batch):
+                added = insert_sites(conn, list(batch))
+                added_total += added
+                print(f"  >> inserted batch: {added} new (total this cycle: {added_total})", flush=True)
+                batch.clear()
+
             time.sleep(0.25)
 
-        added = insert_sites(conn, list(found))
-        total_added += added
+        # Insert any remaining
+        if batch:
+            added = insert_sites(conn, list(batch))
+            added_total += added
+
+        total_added += added_total
         elapsed = time.time() - t0
 
-        print(f"\n[Cycle {cycle}] Done in {elapsed:.1f}s — {len(found)} found, {added} new in DB", flush=True)
+        print(f"\n[Cycle {cycle}] Done in {elapsed:.1f}s — {len(found)} found, {added_total} new in DB", flush=True)
         print(f"All-time: {total_added} added | sleeping {CYCLE_DELAY}s...", flush=True)
         time.sleep(CYCLE_DELAY)
 
