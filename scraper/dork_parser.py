@@ -139,7 +139,8 @@ def parse_ddg(html):
 
 BRAVE_PROFILES = ['chrome110', 'chrome116', 'chrome120', 'edge101', 'safari15_5', 'firefox133']
 _brave_idx = 0
-_brave_cooldown = 0  # when > 0, skip Brave (429 cooldown counter)
+_brave_cooldown_until = 0  # timestamp — skip Brave until this time (time-based, not dork-count)
+BRAVE_COOLDOWN_SECS = int(os.environ.get('BRAVE_COOLDOWN_SECS', '120'))  # 2 min cooldown on 429
 
 # ── Proxy pool (from proxy-manager API) ─────────────────────────────
 PROXY_API_URL = os.environ.get('PROXY_API_URL', 'https://proxy-manager-t69d.onrender.com/proxies?limit=1000')
@@ -203,8 +204,10 @@ def parse_brave(html):
 
 
 def fetch_brave(dork, page=1):
-    """Brave via curl_cffi with proxy rotation. No cooldown — just rotate proxy on 429."""
-    global _brave_idx, _brave_cooldown
+    """Brave via curl_cffi with proxy rotation. Time-based cooldown on 429."""
+    global _brave_idx, _brave_cooldown_until
+    if time.time() < _brave_cooldown_until:
+        return [], 'cooldown'
     url = 'https://search.brave.com/search?q=' + up.quote(dork) + '&source=web'
     if page > 1:
         url += '&offset=%d' % ((page - 1) * 20)
@@ -221,7 +224,7 @@ def fetch_brave(dork, page=1):
                 if r.status_code == 200:
                     return parse_brave(r.text), 'OK'
                 if r.status_code == 429:
-                    _brave_cooldown = 60
+                    _brave_cooldown_until = time.time() + BRAVE_COOLDOWN_SECS
                     return [], '429-noproxy'
                 return [], 'HTTP %d' % r.status_code
             except Exception as e:
@@ -240,6 +243,8 @@ def fetch_brave(dork, page=1):
             mark_proxy_bad(proxy)
             continue  # try next proxy
 
+    # All 3 proxies returned 429 — set cooldown but shorter (30s, not 120s)
+    _brave_cooldown_until = time.time() + 30
     return [], '429-allproxies'
 
 
@@ -315,63 +320,67 @@ def _shopify_kept(urls):
 
 
 def run_shopify_dork(dork):
-    """Bing (multi-page) -> Brave (multi-page) -> DDG fallback.
+    """Brave (multi-page, primary) -> Bing (multi-page, fallback).
     Returns (kept_by_engine: dict, status_str)."""
     got = {e: [] for e in ENGINE_KEYS + ['brave']}
     parts = []
 
-    # Bing: paginate while Shopify URLs are being found. Stop after 3
-    # consecutive pages with 0 Shopify URLs (to skip non-Shopify junk pages).
-    # Hard cap at 20 pages when MAX_PAGES=0 to prevent runaway pagination.
-    bing_urls = []
-    empty_shopify_pages = 0
+    # Brave PRIMARY: finds 200+ Shopify URLs per dork. Bing doesn't index
+    # myshopify.com subdomains so it's only a fallback when Brave is on cooldown.
+    brave_urls = []
     page = 1
     while True:
-        urls, status = run_engine_quick('bing', dork, page=page)
+        urls, status = fetch_brave(dork, page=page)
+        if status == 'cooldown':
+            # Wait for Brave cooldown to expire, then retry
+            wait_secs = int(_brave_cooldown_until - time.time())
+            if wait_secs > 0:
+                print(f'    [Brave cooldown] waiting {wait_secs}s...', flush=True)
+                time.sleep(wait_secs)
+            continue  # retry same page after cooldown
         if status == 'OK' and urls:
-            bing_urls.extend(urls)
-            kept = _shopify_kept(urls)
-            if kept:
-                empty_shopify_pages = 0
-            else:
-                empty_shopify_pages += 1
-                if empty_shopify_pages >= 3:
-                    break
+            brave_urls.extend(urls)
         else:
+            parts.append('Brave:%s(%d)' % (status, 0))
             break
         if MAX_PAGES and page >= MAX_PAGES:
             break
-        if not MAX_PAGES and page >= 20:
+        if not MAX_PAGES and page >= 5:  # hard cap when unlimited
             break
         page += 1
         time.sleep(1)
-    got['bing'] = _shopify_kept(bing_urls)
-    parts.append('Bing:%s(%d)' % ('OK' if bing_urls else '0', len(got['bing'])))
+    got['brave'] = _shopify_kept(brave_urls)
+    if brave_urls:
+        parts.append('Brave:OK(%d)' % len(got['brave']))
 
-    # Brave: keep fetching pages until no results (or MAX_PAGES if set)
-    if not any(got.values()) and CURL_OK:
-        brave_urls = []
+    # Bing FALLBACK: only when Brave found nothing (on cooldown or 429)
+    if not any(got.values()):
+        bing_urls = []
+        empty_shopify_pages = 0
         page = 1
         while True:
-            urls, status = fetch_brave(dork, page=page)
+            urls, status = run_engine_quick('bing', dork, page=page)
             if status == 'OK' and urls:
-                brave_urls.extend(urls)
+                bing_urls.extend(urls)
+                kept = _shopify_kept(urls)
+                if kept:
+                    empty_shopify_pages = 0
+                else:
+                    empty_shopify_pages += 1
+                    if empty_shopify_pages >= 3:
+                        break
             else:
-                parts.append('Brave:%s(%d)' % (status, 0))
                 break
             if MAX_PAGES and page >= MAX_PAGES:
                 break
-            if not MAX_PAGES and page >= 5:  # hard cap when unlimited
+            if not MAX_PAGES and page >= 20:
                 break
             page += 1
             time.sleep(1)
-        got['brave'] = _shopify_kept(brave_urls)
-        if brave_urls:
-            parts.append('Brave:OK(%d)' % len(got['brave']))
+        got['bing'] = _shopify_kept(bing_urls)
+        parts.append('Bing:%s(%d)' % ('OK' if bing_urls else '0', len(got['bing'])))
 
-    # DDG fallback — DISABLED. DDG html endpoint consistently times out
-    # (15s wasted per dork). Bing + Brave cover all sources. Re-enable with
-    # env var USE_DDG=1 if needed.
+    # DDG fallback — DISABLED. Re-enable with env var USE_DDG=1 if needed.
     if not any(got.values()) and os.environ.get('USE_DDG', '0') == '1':
         urls, status = run_engine_quick('duckduckgo', dork)
         got['duckduckgo'] = _shopify_kept(urls)
