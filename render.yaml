@@ -24,10 +24,6 @@ services:
           property: connectionString
       - key: WORKER_BATCH_SIZE
         value: "20"
-      - key: MAX_TABS
-        value: "3"
-      - key: CHROME_POOL_SIZE
-        value: "3"
 
   # ── Python scraper: dork-based Shopify discovery → writes to Postgres ──
   - type: worker

@@ -10,21 +10,7 @@ import (
 )
 
 func main() {
-	// Max concurrent tabs in the single Chrome browser
-	maxTabs := 30
-	if v := os.Getenv("MAX_TABS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxTabs = n
-		}
-	}
-	// Legacy env var support
-	if v := os.Getenv("CHROME_POOL_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxTabs = n
-		}
-	}
-
-	// HTTP port — Railway sets PORT env var
+	// HTTP port — Render/Railway set PORT env var
 	port := "8080"
 	if v := os.Getenv("PORT"); v != "" {
 		port = v
@@ -43,12 +29,8 @@ func main() {
 		defer db.Close()
 		fmt.Println("Database connected, site management enabled")
 	} else {
-		fmt.Println("DATABASE_URL not set — site management disabled (card checking still works)")
+		fmt.Println("DATABASE_URL not set — site management disabled")
 	}
-
-	fmt.Printf("Starting browser with max %d tabs...\n", maxTabs)
-	browser := NewBrowser(maxTabs)
-	defer browser.Close()
 
 	// Worker batch size
 	batchSize := 20
@@ -73,12 +55,11 @@ func main() {
 		<-sig
 		fmt.Println("\nShutting down...")
 		close(stopWorker)
-		browser.Close()
 		if db != nil {
 			db.Close()
 		}
 		os.Exit(0)
 	}()
 
-	StartServer(":"+port, browser, db)
+	StartServer(":"+port, db)
 }
