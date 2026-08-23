@@ -217,17 +217,17 @@ def test_all_proxies():
 def get_next_proxy():
     """Get next good proxy from tested pool (round-robin, skip bad ones)."""
     global _proxy_idx, _tested_proxies, _proxy_last_test
-    if not _tested_proxies or (time.time() - _proxy_last_test > PROXY_RETEST_INTERVAL):
+    # Only re-test if it's been > PROXY_RETEST_INTERVAL since last full test
+    if not _tested_proxies:
+        test_all_proxies()
+    elif (time.time() - _proxy_last_test > PROXY_RETEST_INTERVAL) and not _proxy_bad:
         test_all_proxies()
     if not _tested_proxies:
         return None
     good = [p for p in _tested_proxies if p not in _proxy_bad]
     if not good:
-        # All tested proxies bad — re-test
-        _proxy_bad.clear()
-        if test_all_proxies():
-            good = list(_tested_proxies)
-    if not good:
+        # All tested proxies bad — DON'T re-test (too slow). Return None
+        # and let fetch_brave use direct connection + cooldown.
         return None
     proxy = good[_proxy_idx % len(good)]
     _proxy_idx += 1
@@ -285,6 +285,8 @@ def fetch_brave(dork, page=1):
             return parse_brave(r.text), 'OK'
         if r.status_code == 429:
             _brave_cooldown_until = time.time() + BRAVE_COOLDOWN_SECS
+            # Clear bad proxies so they get retried after cooldown
+            _proxy_bad.clear()
             return [], '429'
         return [], 'HTTP %d' % r.status_code
     except Exception as e:
