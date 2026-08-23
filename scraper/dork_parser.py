@@ -252,21 +252,28 @@ def run_shopify_dork(dork):
     got = {e: [] for e in ENGINE_KEYS + ['brave']}
     parts = []
 
-    # Bing: keep fetching pages until no results (or MAX_PAGES if set).
-    # Key fix: hard cap at 5 pages when MAX_PAGES=0 to prevent 15-page waste,
-    # but use raw URLs (not Shopify-filtered) for continuation so we don't
-    # miss Shopify results on page 2+ when page 1 has only non-Shopify URLs.
+    # Bing: paginate while Shopify URLs are being found. Stop after 3
+    # consecutive pages with 0 Shopify URLs (to skip non-Shopify junk pages).
+    # Hard cap at 20 pages when MAX_PAGES=0 to prevent runaway pagination.
     bing_urls = []
+    empty_shopify_pages = 0
     page = 1
     while True:
         urls, status = run_engine_quick('bing', dork, page=page)
         if status == 'OK' and urls:
             bing_urls.extend(urls)
+            kept = _shopify_kept(urls)
+            if kept:
+                empty_shopify_pages = 0
+            else:
+                empty_shopify_pages += 1
+                if empty_shopify_pages >= 3:
+                    break
         else:
             break
         if MAX_PAGES and page >= MAX_PAGES:
             break
-        if not MAX_PAGES and page >= 5:  # hard cap when unlimited
+        if not MAX_PAGES and page >= 20:
             break
         page += 1
         time.sleep(1)
