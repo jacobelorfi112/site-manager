@@ -204,7 +204,8 @@ def parse_brave(html):
 
 
 def fetch_brave(dork, page=1):
-    """Brave via curl_cffi with proxy rotation. Time-based cooldown on 429."""
+    """Brave via curl_cffi. Direct connection with retry — public proxies are
+    too unreliable for HTTPS. On 429, short cooldown + retry."""
     global _brave_idx, _brave_cooldown_until
     if time.time() < _brave_cooldown_until:
         return [], 'cooldown'
@@ -214,38 +215,17 @@ def fetch_brave(dork, page=1):
     prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
     _brave_idx += 1
 
-    # Try up to 3 proxies before giving up on this dork
-    for attempt in range(3):
-        proxy = get_next_proxy()
-        if not proxy:
-            # No proxies — try direct (no proxy) as last resort
-            try:
-                r = curl_requests.get(url, impersonate=prof, timeout=15)
-                if r.status_code == 200:
-                    return parse_brave(r.text), 'OK'
-                if r.status_code == 429:
-                    _brave_cooldown_until = time.time() + BRAVE_COOLDOWN_SECS
-                    return [], '429-noproxy'
-                return [], 'HTTP %d' % r.status_code
-            except Exception as e:
-                return '', '%s' % e.__class__.__name__
-
-        proxies_dict = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
-        try:
-            r = curl_requests.get(url, impersonate=prof, timeout=15, proxies=proxies_dict)
-            if r.status_code == 200:
-                return parse_brave(r.text), 'OK'
-            if r.status_code == 429:
-                mark_proxy_bad(proxy)
-                continue  # rotate to next proxy immediately
-            return [], 'HTTP %d' % r.status_code
-        except Exception:
-            mark_proxy_bad(proxy)
-            continue  # try next proxy
-
-    # All 3 proxies returned 429 — set cooldown but shorter (30s, not 120s)
-    _brave_cooldown_until = time.time() + 30
-    return [], '429-allproxies'
+    # Try direct connection (no proxy — public proxies are all dead for HTTPS)
+    try:
+        r = curl_requests.get(url, impersonate=prof, timeout=15)
+        if r.status_code == 200:
+            return parse_brave(r.text), 'OK'
+        if r.status_code == 429:
+            _brave_cooldown_until = time.time() + BRAVE_COOLDOWN_SECS
+            return [], '429'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
 
 
 PARSERS = {
