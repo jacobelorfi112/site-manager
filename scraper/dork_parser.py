@@ -139,48 +139,94 @@ def parse_ddg(html):
 
 BRAVE_PROFILES = ['chrome110', 'chrome116', 'chrome120', 'edge101', 'safari15_5', 'firefox133']
 _brave_idx = 0
-_brave_cooldown_until = 0  # timestamp — skip Brave until this time (time-based, not dork-count)
-BRAVE_COOLDOWN_SECS = int(os.environ.get('BRAVE_COOLDOWN_SECS', '120'))  # 2 min cooldown on 429
+_brave_cooldown_until = 0  # timestamp — skip Brave until this time
+BRAVE_COOLDOWN_SECS = int(os.environ.get('BRAVE_COOLDOWN_SECS', '30'))  # 30s cooldown when all proxies 429
 
-# ── Proxy pool (from proxy-manager API) ─────────────────────────────
-PROXY_API_URL = os.environ.get('PROXY_API_URL', 'https://proxy-manager-t69d.onrender.com/proxies?limit=1000')
-_proxy_pool = []
+# ── Proxy pool (tested working for Brave HTTPS) ─────────────────────
+PROXY_API_URL = os.environ.get('PROXY_API_URL', 'https://proxy-manager-t69d.onrender.com/proxies?limit=10000')
+_tested_proxies = []  # only proxies that passed the Brave HTTPS test
 _proxy_idx = 0
 _proxy_bad = set()
-_proxy_last_refresh = 0
-PROXY_REFRESH_INTERVAL = 1800  # refresh proxy list every 30 min
+_proxy_last_test = 0
+PROXY_RETEST_INTERVAL = 600  # re-test all proxies every 10 min
+
+try:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _THREADS_AVAILABLE = True
+except ImportError:
+    _THREADS_AVAILABLE = False
 
 
-def fetch_proxies():
-    """Fetch proxies from proxy-manager API."""
-    global _proxy_pool, _proxy_bad, _proxy_last_refresh
+def _test_single_proxy(proxy):
+    """Test if a proxy can reach Brave (HTTPS). Returns proxy string if OK, None if not."""
     try:
-        r = curl_requests.get(PROXY_API_URL, timeout=20)
+        r = curl_requests.get('https://search.brave.com/search?q=test&source=web',
+                              impersonate='chrome120', timeout=6,
+                              proxies={'http': f'http://{proxy}', 'https': f'http://{proxy}'})
         if r.status_code == 200:
-            proxies = [l.strip() for l in r.text.strip().split('\n') if l.strip()]
-            _proxy_pool = proxies
-            _proxy_bad = set()
-            _proxy_last_refresh = time.time()
-            print(f'[proxy] loaded {len(proxies)} proxies from API', flush=True)
-            return True
+            return proxy
+    except Exception:
+        pass
+    return None
+
+
+def test_all_proxies():
+    """Fetch ALL proxies from API, test each against Brave in parallel.
+    Only ~0.2% of public proxies can tunnel HTTPS to Brave without being 429'd."""
+    global _tested_proxies, _proxy_bad, _proxy_last_test
+    try:
+        r = curl_requests.get(PROXY_API_URL, timeout=30)
+        if r.status_code != 200:
+            print('[proxy] API fetch failed', flush=True)
+            return False
+        all_proxies = [l.strip() for l in r.text.strip().split('\n') if l.strip()]
     except Exception as e:
-        print(f'[proxy] failed to fetch: {e}', flush=True)
-    return False
+        print(f'[proxy] API fetch error: {e}', flush=True)
+        return False
+
+    print(f'[proxy] testing {len(all_proxies)} proxies for Brave HTTPS...', flush=True)
+    good = []
+    if _THREADS_AVAILABLE:
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(_test_single_proxy, p): p for p in all_proxies}
+            done = 0
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result:
+                    good.append(result)
+                    print(f'[proxy] FOUND working: {result}', flush=True)
+                done += 1
+                if done % 1000 == 0:
+                    print(f'[proxy] ...{done}/{len(all_proxies)} tested ({len(good)} working)', flush=True)
+    else:
+        for i, p in enumerate(all_proxies):
+            result = _test_single_proxy(p)
+            if result:
+                good.append(result)
+                print(f'[proxy] FOUND working: {result}', flush=True)
+            if (i + 1) % 1000 == 0:
+                print(f'[proxy] ...{i+1}/{len(all_proxies)} tested ({len(good)} working)', flush=True)
+
+    _tested_proxies = good
+    _proxy_bad = set()
+    _proxy_last_test = time.time()
+    print(f'[proxy] {len(good)} working proxies for Brave out of {len(all_proxies)}', flush=True)
+    return len(good) > 0
 
 
 def get_next_proxy():
-    """Get next good proxy from pool (round-robin, skip bad ones)."""
-    global _proxy_idx, _proxy_pool, _proxy_last_refresh
-    if not _proxy_pool or (time.time() - _proxy_last_refresh > PROXY_REFRESH_INTERVAL):
-        fetch_proxies()
-    if not _proxy_pool:
+    """Get next good proxy from tested pool (round-robin, skip bad ones)."""
+    global _proxy_idx, _tested_proxies, _proxy_last_test
+    if not _tested_proxies or (time.time() - _proxy_last_test > PROXY_RETEST_INTERVAL):
+        test_all_proxies()
+    if not _tested_proxies:
         return None
-    good = [p for p in _proxy_pool if p not in _proxy_bad]
+    good = [p for p in _tested_proxies if p not in _proxy_bad]
     if not good:
-        # All proxies bad — refresh and retry once
+        # All tested proxies bad — re-test
         _proxy_bad.clear()
-        if fetch_proxies():
-            good = list(_proxy_pool)
+        if test_all_proxies():
+            good = list(_tested_proxies)
     if not good:
         return None
     proxy = good[_proxy_idx % len(good)]
@@ -189,7 +235,7 @@ def get_next_proxy():
 
 
 def mark_proxy_bad(proxy):
-    """Mark a proxy as bad (dead/timeout)."""
+    """Mark a proxy as bad (429'd or dead)."""
     _proxy_bad.add(proxy)
 
 
@@ -204,8 +250,7 @@ def parse_brave(html):
 
 
 def fetch_brave(dork, page=1):
-    """Brave via curl_cffi. Direct connection with retry — public proxies are
-    too unreliable for HTTPS. On 429, short cooldown + retry."""
+    """Brave via curl_cffi with tested proxy rotation. Direct fallback if no proxies."""
     global _brave_idx, _brave_cooldown_until
     if time.time() < _brave_cooldown_until:
         return [], 'cooldown'
@@ -215,7 +260,25 @@ def fetch_brave(dork, page=1):
     prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
     _brave_idx += 1
 
-    # Try direct connection (no proxy — public proxies are all dead for HTTPS)
+    # Try up to 3 tested proxies before falling back to direct
+    for attempt in range(3):
+        proxy = get_next_proxy()
+        if not proxy:
+            break  # no tested proxies — try direct below
+        proxies_dict = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
+        try:
+            r = curl_requests.get(url, impersonate=prof, timeout=15, proxies=proxies_dict)
+            if r.status_code == 200:
+                return parse_brave(r.text), 'OK'
+            if r.status_code == 429:
+                mark_proxy_bad(proxy)
+                continue  # rotate to next proxy
+            return [], 'HTTP %d' % r.status_code
+        except Exception:
+            mark_proxy_bad(proxy)
+            continue
+
+    # Direct connection as last resort (Render's IP, will likely 429)
     try:
         r = curl_requests.get(url, impersonate=prof, timeout=15)
         if r.status_code == 200:
