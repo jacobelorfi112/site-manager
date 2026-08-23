@@ -18,7 +18,7 @@ import urllib.parse as up
 import psycopg2
 import psycopg2.extras
 
-from dork_parser import run_shopify_dork, SHOPIFY_DORKS_FILE, SHOPIFY_DELAY
+from dork_parser import run_shopify_dork, SHOPIFY_DORKS_FILE, SHOPIFY_DELAY, MAX_PAGES
 
 # ── Config ──────────────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -99,6 +99,7 @@ def main():
     print("Scraper Worker starting (dork-based Shopify discovery)", flush=True)
     print(f"  Engines: Bing + Brave (curl_cffi) + DDG fallback", flush=True)
     print(f"  Dork file: {DORKS_FILE}", flush=True)
+    print(f"  Pages per dork: {MAX_PAGES}", flush=True)
     print(f"  Cycle delay: {CYCLE_DELAY}s", flush=True)
 
     conn = connect_db()

@@ -152,13 +152,15 @@ def parse_brave(html):
     return out
 
 
-def fetch_brave(dork):
+def fetch_brave(dork, page=1):
     """Brave via curl_cffi browser impersonation; rotate profiles + 429 backoff."""
     global _brave_idx, _brave_cooldown
     if _brave_cooldown > 0:
         _brave_cooldown -= 1
         return [], 'cooldown'
     url = 'https://search.brave.com/search?q=' + up.quote(dork) + '&source=web'
+    if page > 1:
+        url += '&offset=%d' % ((page - 1) * 20)
     prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
     _brave_idx += 1
     try:
@@ -184,12 +186,16 @@ ENGINE_LABELS = {'bing': 'Bing', 'duckduckgo': 'DuckDuckGo', 'brave': 'Brave'}
 SHOPIFY_DORKS_FILE = 'shopify_dorks.txt'
 SHOPIFY_HOST_SUFFIX = '.myshopify.com'
 SHOPIFY_DELAY = 3.0  # seconds between dorks (avoid burning rate limits)
+MAX_PAGES = int(os.environ.get('MAX_PAGES', '3'))  # pages per dork per engine
 
 
-def fetch_engine(engine, dork):
+def fetch_engine(engine, dork, page=1):
     name, url_tpl, parse_fn, delay = PARSERS[engine]
     query = dork if engine != 'bing' else dork
     url = url_tpl.format(q=up.quote(query))
+    # Bing pagination: &first=30 for page 2, &first=60 for page 3, etc.
+    if page > 1 and engine == 'bing':
+        url += '&first=%d' % ((page - 1) * 30)
     if delay:
         time.sleep(delay)
     html, status = curl_get(url, name)
@@ -199,12 +205,12 @@ def fetch_engine(engine, dork):
     return urls, status
 
 
-def run_engine(engine, dork):
+def run_engine(engine, dork, page=1):
     """One dork on one engine, with rate-limit handling."""
     name = PARSERS[engine][0]
     last = ''
     for attempt in range(3):
-        urls, status = fetch_engine(engine, dork)
+        urls, status = fetch_engine(engine, dork, page=page)
         if status == 'OK':
             return urls, status
         last = status
@@ -215,9 +221,9 @@ def run_engine(engine, dork):
     return [], status if status else last
 
 
-def run_engine_quick(engine, dork):
+def run_engine_quick(engine, dork, page=1):
     """Single best-effort attempt (for DDG fallback - avoids long backoff stalls)."""
-    urls, status = fetch_engine(engine, dork)
+    urls, status = fetch_engine(engine, dork, page=page)
     return urls, status
 
 
@@ -241,17 +247,41 @@ def _shopify_kept(urls):
 
 
 def run_shopify_dork(dork):
-    """Bing (cheap) -> Brave (curl_cffi, site:-reliable) -> DDG fallback.
+    """Bing (multi-page) -> Brave (multi-page) -> DDG fallback.
     Returns (kept_by_engine: dict, status_str)."""
-    got = {e: [] for e in ENGINE_KEYS}
+    got = {e: [] for e in ENGINE_KEYS + ['brave']}
     parts = []
-    urls, status = run_engine_quick('bing', dork)
-    got['bing'] = _shopify_kept(urls)
-    parts.append('Bing:%s(%d)' % (status, len(got['bing'])))
+
+    # Bing: try up to MAX_PAGES pages
+    bing_urls = []
+    for page in range(1, MAX_PAGES + 1):
+        urls, status = run_engine_quick('bing', dork, page=page)
+        if status == 'OK' and urls:
+            bing_urls.extend(urls)
+        else:
+            break
+        if page < MAX_PAGES:
+            time.sleep(1)
+    got['bing'] = _shopify_kept(bing_urls)
+    parts.append('Bing:%s(%d)' % ('OK' if bing_urls else '0', len(got['bing'])))
+
+    # Brave: try up to MAX_PAGES pages (if Bing found nothing or as supplement)
     if not any(got.values()) and CURL_OK:
-        urls, status = fetch_brave(dork)
-        got['brave'] = _shopify_kept(urls)
-        parts.append('Brave:%s(%d)' % (status, len(got['brave'])))
+        brave_urls = []
+        for page in range(1, MAX_PAGES + 1):
+            urls, status = fetch_brave(dork, page=page)
+            if status == 'OK' and urls:
+                brave_urls.extend(urls)
+            else:
+                parts.append('Brave:%s(%d)' % (status, 0))
+                break
+            if page < MAX_PAGES:
+                time.sleep(1)
+        got['brave'] = _shopify_kept(brave_urls)
+        if brave_urls:
+            parts.append('Brave:OK(%d)' % len(got['brave']))
+
+    # DDG fallback (single page — DDG HTML doesn't support easy pagination)
     if not any(got.values()):
         urls, status = run_engine_quick('duckduckgo', dork)
         got['duckduckgo'] = _shopify_kept(urls)
