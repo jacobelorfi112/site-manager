@@ -18,7 +18,7 @@ import urllib.parse as up
 import psycopg2
 import psycopg2.extras
 
-from dork_parser import run_shopify_dork, SHOPIFY_DORKS_FILE
+from dork_parser import run_shopify_dork, SHOPIFY_DORKS_FILE, SHOPIFY_DELAY
 
 # ── Config ──────────────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -145,7 +145,7 @@ def main():
                 print(f"  >> inserted batch: {added} new (total this cycle: {added_total})", flush=True)
                 batch.clear()
 
-            time.sleep(0.25)
+            time.sleep(SHOPIFY_DELAY)
 
         # Insert any remaining
         if batch:

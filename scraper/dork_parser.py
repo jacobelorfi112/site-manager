@@ -60,9 +60,29 @@ SSLC.verify_mode = ssl.CERT_NONE
 
 
 def http_get(url):
+    """Plain urllib GET — only used as fallback. Prefer curl_cffi when available."""
     req = ur.Request(url, headers=HEADERS)
     r = ur.urlopen(req, context=SSLC, timeout=TIMEOUT)
     return r.status, r.read().decode('utf-8', 'replace')
+
+
+def curl_get(url, engine_label=''):
+    """Browser-impersonated GET via curl_cffi. Returns (html, status_str)."""
+    global _brave_idx
+    if not CURL_OK:
+        st, html = http_get(url)
+        return html, 'OK' if st == 200 else 'HTTP %d' % st
+    prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
+    _brave_idx += 1
+    try:
+        r = curl_requests.get(url, impersonate=prof, timeout=15)
+        if r.status_code == 200:
+            return r.text, 'OK'
+        if r.status_code == 429:
+            return '', '429'
+        return '', 'HTTP %d' % r.status_code
+    except Exception as e:
+        return '', '%s' % e.__class__.__name__
 
 
 def b64_decode_url(s):
@@ -76,6 +96,7 @@ def b64_decode_url(s):
 def parse_bing(html):
     """Extract organic result URLs from a Bing results page."""
     out = []
+    # Bing wraps result URLs in base64 redirect links (u=a1... / u=a2...).
     for href in re.findall(r'class="tilk"[^>]*href="([^"]+)"', html):
         m = re.search(r'u=a[12]([A-Za-z0-9+/=]+)', href)
         if m:
@@ -91,6 +112,11 @@ def parse_bing(html):
             if u.startswith('http'):
                 out.append(u)
         elif href.startswith('http'):
+            out.append(href)
+    # Fallback: any direct http(s) href in cite tags (Bing's visible URLs).
+    for href in re.findall(r'<cite[^>]*>([^<]+)</cite>', html):
+        href = href.strip()
+        if href.startswith('http'):
             out.append(href)
     return out
 
@@ -113,6 +139,7 @@ def parse_ddg(html):
 
 BRAVE_PROFILES = ['chrome110', 'chrome116', 'chrome120', 'edge101', 'safari15_5', 'firefox133']
 _brave_idx = 0
+_brave_cooldown = 0  # when > 0, skip Brave (429 cooldown counter)
 
 
 def parse_brave(html):
@@ -127,22 +154,23 @@ def parse_brave(html):
 
 def fetch_brave(dork):
     """Brave via curl_cffi browser impersonation; rotate profiles + 429 backoff."""
-    global _brave_idx
+    global _brave_idx, _brave_cooldown
+    if _brave_cooldown > 0:
+        _brave_cooldown -= 1
+        return [], 'cooldown'
     url = 'https://search.brave.com/search?q=' + up.quote(dork) + '&source=web'
-    for attempt in range(4):
-        prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
-        _brave_idx += 1
-        try:
-            r = curl_requests.get(url, impersonate=prof, timeout=15)
-            if r.status_code == 200:
-                return parse_brave(r.text), 'OK'
-            if r.status_code == 429:
-                time.sleep(5 + attempt * 7)
-                continue
-            return [], 'HTTP %d' % r.status_code
-        except Exception as e:
-            return [], '%s' % e.__class__.__name__
-    return [], '429'
+    prof = BRAVE_PROFILES[_brave_idx % len(BRAVE_PROFILES)]
+    _brave_idx += 1
+    try:
+        r = curl_requests.get(url, impersonate=prof, timeout=15)
+        if r.status_code == 200:
+            return parse_brave(r.text), 'OK'
+        if r.status_code == 429:
+            _brave_cooldown = 30  # skip Brave for the next 30 dorks
+            return [], '429'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
 
 
 PARSERS = {
@@ -155,7 +183,7 @@ ENGINE_LABELS = {'bing': 'Bing', 'duckduckgo': 'DuckDuckGo', 'brave': 'Brave'}
 
 SHOPIFY_DORKS_FILE = 'shopify_dorks.txt'
 SHOPIFY_HOST_SUFFIX = '.myshopify.com'
-SHOPIFY_DELAY = 0.25
+SHOPIFY_DELAY = 3.0  # seconds between dorks (avoid burning rate limits)
 
 
 def fetch_engine(engine, dork):
@@ -164,32 +192,24 @@ def fetch_engine(engine, dork):
     url = url_tpl.format(q=up.quote(query))
     if delay:
         time.sleep(delay)
-    st, html = http_get(url)
-    if st != 200:
-        return [], 'HTTP %d' % st
+    html, status = curl_get(url, name)
+    if status != 'OK':
+        return [], status
     urls = [u for u in parse_fn(html) if not any(j in u.lower() for j in JUNK)]
-    return urls, 'OK'
+    return urls, status
 
 
 def run_engine(engine, dork):
-    """One dork on one engine, with DDG rate-limit handling."""
+    """One dork on one engine, with rate-limit handling."""
     name = PARSERS[engine][0]
     last = ''
     for attempt in range(3):
-        try:
-            urls, status = fetch_engine(engine, dork)
-        except ur.HTTPError as e:
-            last = 'HTTP %d' % e.code
-            status = last
-            urls = []
-        except Exception as e:
-            last = '%s' % e.__class__.__name__
-            status = last
-            urls = []
+        urls, status = fetch_engine(engine, dork)
         if status == 'OK':
             return urls, status
-        if '429' in status or '202' in status or '503' in status or '5' == status[0]:
-            time.sleep(2.5 * (attempt + 1))  # rate-limited: back off and retry
+        last = status
+        if '429' in status or '202' in status or '503' in status or (status and status[0] == '5'):
+            time.sleep(2.5 * (attempt + 1))
         else:
             break
     return [], status if status else last
@@ -197,14 +217,7 @@ def run_engine(engine, dork):
 
 def run_engine_quick(engine, dork):
     """Single best-effort attempt (for DDG fallback - avoids long backoff stalls)."""
-    try:
-        urls, status = fetch_engine(engine, dork)
-    except ur.HTTPError as e:
-        status = 'HTTP %d' % e.code
-        urls = []
-    except Exception as e:
-        status = '%s' % e.__class__.__name__
-        urls = []
+    urls, status = fetch_engine(engine, dork)
     return urls, status
 
 
