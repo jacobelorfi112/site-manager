@@ -97,7 +97,7 @@ def load_dorks(path):
 
 def main():
     print("Scraper Worker starting (dork-based Shopify discovery)", flush=True)
-    print(f"  Engines: Brave (primary, proxy-tested) + Bing (fallback) + DDG (disabled)", flush=True)
+    print(f"  Engines: NeoSearch (primary) + Brave (proxy) + Bing (fallback) + DDG (disabled)", flush=True)
     print(f"  Dork file: {DORKS_FILE}", flush=True)
     print(f"  Pages per dork: {MAX_PAGES or 'unlimited (until no results)'}", flush=True)
     print(f"  Cycle delay: {CYCLE_DELAY}s", flush=True)

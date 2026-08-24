@@ -16,6 +16,7 @@ Usage:
 """
 
 import base64
+import json
 import os
 import re
 import ssl
@@ -249,6 +250,86 @@ def parse_brave(html):
     return out
 
 
+# ── NeoSearch engine ────────────────────────────────────────────────
+_neosearch_xsrf_token = ''
+_neosearch_token_fetched = 0
+NEOSEARCH_TOKEN_REFRESH = 300  # refresh token every 5 min
+
+
+def _neosearch_get_token():
+    """Fetch XSRF token from neosearch.org homepage."""
+    global _neosearch_xsrf_token, _neosearch_token_fetched
+    try:
+        r = curl_requests.get('https://neosearch.org/', impersonate='chrome120', timeout=15)
+        m = re.search(r'<meta\s+name="xsrf-token"\s+content="([^"]+)"', r.text)
+        if m:
+            _neosearch_xsrf_token = m.group(1)
+            _neosearch_token_fetched = time.time()
+            return True
+    except Exception as e:
+        print(f'[neosearch] token fetch error: {e.__class__.__name__}', flush=True)
+    return False
+
+
+def parse_neosearch(content):
+    """Parse NeoSearch newline-delimited JSON response. Extracts URLs from
+    lenses → categories → links structure."""
+    out = []
+    for line in content.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        for lens in obj.get('lenses', []):
+            for cat in lens.get('categories', []):
+                for link in cat.get('links', []):
+                    url = link.get('url', '')
+                    if url.startswith('http'):
+                        out.append(url)
+    return out
+
+
+def fetch_neosearch(dork, page=1):
+    """NeoSearch API — no proxies needed, no 429s, returns 16-20 Shopify URLs/dork.
+    Supports site: dorks. Uses XSRF token from homepage."""
+    global _neosearch_xsrf_token, _neosearch_token_fetched
+    if not _neosearch_xsrf_token or (time.time() - _neosearch_token_fetched > NEOSEARCH_TOKEN_REFRESH):
+        if not _neosearch_get_token():
+            return [], 'no-token'
+    body = json.dumps({'q': dork, 'generate': 'auto', 'loc': None})
+    referer = 'https://neosearch.org/?q=' + up.quote(dork)
+    headers = {
+        'X-XSRF-TOKEN': _neosearch_xsrf_token,
+        'Origin': 'https://neosearch.org',
+        'Referer': referer,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/json',
+    }
+    try:
+        r = curl_requests.post('https://neosearch.org/search',
+                              data=body, headers=headers,
+                              impersonate='chrome120', timeout=20)
+        if r.status_code == 200:
+            return parse_neosearch(r.text), 'OK'
+        if r.status_code == 403 or r.status_code == 502:
+            # Cloudflare block — refresh token and retry once
+            if _neosearch_get_token():
+                headers['X-XSRF-TOKEN'] = _neosearch_xsrf_token
+                r2 = curl_requests.post('https://neosearch.org/search',
+                                        data=body, headers=headers,
+                                        impersonate='chrome120', timeout=20)
+                if r2.status_code == 200:
+                    return parse_neosearch(r2.text), 'OK'
+            return [], 'CF-%d' % r.status_code
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
+
+
 def fetch_brave(dork, page=1):
     """Brave via curl_cffi with tested proxy rotation. Direct fallback if no proxies."""
     global _brave_idx, _brave_cooldown_until
@@ -365,40 +446,48 @@ def _shopify_kept(urls):
 
 
 def run_shopify_dork(dork):
-    """Brave (multi-page, primary) -> Bing (multi-page, fallback).
+    """NeoSearch (primary, no proxy needed) -> Brave (proxy) -> Bing (fallback).
     Returns (kept_by_engine: dict, status_str)."""
-    got = {e: [] for e in ENGINE_KEYS + ['brave']}
+    got = {e: [] for e in ENGINE_KEYS + ['brave', 'neosearch']}
     parts = []
 
-    # Brave PRIMARY: finds 200+ Shopify URLs per dork. Bing doesn't index
-    # myshopify.com subdomains so it's only a fallback when Brave is on cooldown.
-    brave_urls = []
-    page = 1
-    while True:
-        urls, status = fetch_brave(dork, page=page)
-        if status == 'cooldown':
-            # Wait for Brave cooldown to expire, then retry
-            wait_secs = int(_brave_cooldown_until - time.time())
-            if wait_secs > 0:
-                print(f'    [Brave cooldown] waiting {wait_secs}s...', flush=True)
-                time.sleep(wait_secs)
-            continue  # retry same page after cooldown
-        if status == 'OK' and urls:
-            brave_urls.extend(urls)
-        else:
-            parts.append('Brave:%s(%d)' % (status, 0))
-            break
-        if MAX_PAGES and page >= MAX_PAGES:
-            break
-        if not MAX_PAGES and page >= 5:  # hard cap when unlimited
-            break
-        page += 1
-        time.sleep(1)
-    got['brave'] = _shopify_kept(brave_urls)
-    if brave_urls:
-        parts.append('Brave:OK(%d)' % len(got['brave']))
+    # NeoSearch PRIMARY: no proxies needed, no 429s, 16-20 Shopify URLs/dork.
+    # Supports site: dorks. Works from any IP (including Render).
+    neo_urls, neo_status = fetch_neosearch(dork)
+    got['neosearch'] = _shopify_kept(neo_urls)
+    if neo_status == 'OK':
+        parts.append('Neo:OK(%d)' % len(got['neosearch']))
+    else:
+        parts.append('Neo:%s(%d)' % (neo_status, len(got['neosearch'])))
 
-    # Bing FALLBACK: only when Brave found nothing (on cooldown or 429)
+    # Brave SECONDARY: if NeoSearch found nothing, try Brave with proxy rotation
+    if not any(got.values()):
+        brave_urls = []
+        page = 1
+        while True:
+            urls, status = fetch_brave(dork, page=page)
+            if status == 'cooldown':
+                wait_secs = int(_brave_cooldown_until - time.time())
+                if wait_secs > 0:
+                    print(f'    [Brave cooldown] waiting {wait_secs}s...', flush=True)
+                    time.sleep(wait_secs)
+                continue
+            if status == 'OK' and urls:
+                brave_urls.extend(urls)
+            else:
+                parts.append('Brave:%s(%d)' % (status, 0))
+                break
+            if MAX_PAGES and page >= MAX_PAGES:
+                break
+            if not MAX_PAGES and page >= 5:
+                break
+            page += 1
+            time.sleep(1)
+        got['brave'] = _shopify_kept(brave_urls)
+        if brave_urls:
+            parts.append('Brave:OK(%d)' % len(got['brave']))
+
+    # Bing FALLBACK: only when both NeoSearch and Brave found nothing
     if not any(got.values()):
         bing_urls = []
         empty_shopify_pages = 0
