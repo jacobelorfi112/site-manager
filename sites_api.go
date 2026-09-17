@@ -212,7 +212,7 @@ func parseSiteText(text string) []string {
 	return urls
 }
 
-// GET /sites/working?limit=100&offset=0
+// GET /sites/working?limit=100&offset=0&max_price=5&sort=price_asc
 func handleWorkingSites(w http.ResponseWriter, r *http.Request, db *DB) {
 	if r.Method != http.MethodGet {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -232,7 +232,19 @@ func handleWorkingSites(w http.ResponseWriter, r *http.Request, db *DB) {
 		}
 	}
 
-	sites, total, err := db.GetWorkingSites(limit, offset)
+	// max_price: only return sites whose stored checkout_price is <= max_price
+	// (e.g. /sites/working?max_price=5 — for the bot's affordable-sites flow).
+	maxPrice := 0.0
+	if v := r.URL.Query().Get("max_price"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil && p > 0 {
+			maxPrice = p
+		}
+	}
+
+	// sort: "price_asc" orders by checkout_price ascending (cheapest first).
+	sort := r.URL.Query().Get("sort")
+
+	sites, total, err := db.GetWorkingSites(limit, offset, maxPrice, sort)
 	if err != nil {
 		log.Printf("Error getting working sites: %v", err)
 		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
@@ -281,7 +293,7 @@ func handleExport(w http.ResponseWriter, r *http.Request, db *DB) {
 		return
 	}
 
-	sites, _, err := db.GetWorkingSites(10000, 0)
+	sites, _, err := db.GetWorkingSites(10000, 0, 0, "")
 	if err != nil {
 		http.Error(w, "database error", http.StatusInternalServerError)
 		return
@@ -351,7 +363,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, db *DB) {
 		total += v
 	}
 
-	sites, workingTotal, err := db.GetWorkingSites(500, 0)
+	sites, workingTotal, err := db.GetWorkingSites(500, 0, 0, "")
 	if err != nil {
 		http.Error(w, "database error", http.StatusInternalServerError)
 		return

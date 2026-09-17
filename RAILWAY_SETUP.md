@@ -112,7 +112,11 @@ Response:
 }
 ```
 
-### `GET /sites/working?limit=100&offset=0` — List working sites
+### `GET /sites/working?limit=100&offset=0&max_price=5&sort=price_asc` — List working sites
+- `limit` / `offset` — pagination (limit max 1000).
+- `max_price` — only return sites whose stored `checkout_price` is <= this value (cheapest product at last check). `0`/unset = no filter.
+- `sort` — `price_asc` orders by `checkout_price` ascending (cheapest first); unset keeps default `last_checked DESC`.
+
 ```json
 {
   "total": 450,
@@ -124,6 +128,7 @@ Response:
       "url": "https://cool-store.myshopify.com",
       "status": "working",
       "error_code": "INCORRECT_NUMBER",
+      "checkout_price": 4.99,
       "last_checked": "2026-03-20T10:30:00Z"
     }
   ]

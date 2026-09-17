@@ -187,20 +187,37 @@ func (db *DB) RevertToPending(id int64) error {
 	return err
 }
 
-// GetWorkingSites returns all sites with status "working".
-func (db *DB) GetWorkingSites(limit, offset int) ([]Site, int, error) {
+// GetWorkingSites returns sites with status "working".
+// maxPrice > 0 filters to sites whose stored checkout_price is <= maxPrice
+// (0 = no price filter). sort == "price_asc" orders by checkout_price
+// ascending (cheapest first); any other value keeps the default
+// last_checked DESC ordering.
+func (db *DB) GetWorkingSites(limit, offset int, maxPrice float64, sort string) ([]Site, int, error) {
+	where := `WHERE status = 'working'`
+	args := []interface{}{}
+	if maxPrice > 0 {
+		args = append(args, maxPrice)
+		where += fmt.Sprintf(" AND checkout_price <= $%d", len(args))
+	}
+
 	var total int
-	err := db.conn.QueryRow(`SELECT COUNT(*) FROM sites WHERE status = 'working'`).Scan(&total)
+	err := db.conn.QueryRow(`SELECT COUNT(*) FROM sites `+where, args...).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	rows, err := db.conn.Query(`
+	order := "last_checked DESC"
+	if sort == "price_asc" {
+		order = "checkout_price ASC"
+	}
+
+	args = append(args, limit, offset)
+	rows, err := db.conn.Query(fmt.Sprintf(`
 		SELECT id, url, status, error_code, error_msg, checkout_price, check_count, last_checked, created_at, updated_at
-		FROM sites WHERE status = 'working'
-		ORDER BY last_checked DESC
-		LIMIT $1 OFFSET $2
-	`, limit, offset)
+		FROM sites %s
+		ORDER BY %s
+		LIMIT $%d OFFSET $%d
+	`, where, order, len(args)-1, len(args)), args...)
 	if err != nil {
 		return nil, 0, err
 	}
