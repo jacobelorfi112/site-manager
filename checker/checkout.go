@@ -66,9 +66,10 @@ type Variant struct {
 // ──────────────────────── Step 0: find cheapest available product ────
 
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
-	// Try sorted endpoint first; fall back to plain if store returns 404.
+	// /collections/all/products.json is the only endpoint that honors
+	// sort_by (root /products.json ignores it); fall back to plain on 404.
 	candidates := []string{
-		shopURL + "/products.json?limit=250&sort_by=price-ascending",
+		shopURL + "/collections/all/products.json?limit=250&sort_by=price-ascending",
 		shopURL + "/products.json?limit=250",
 	}
 

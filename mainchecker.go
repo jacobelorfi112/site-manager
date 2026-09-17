@@ -463,9 +463,12 @@ func findCheapestProductUncached(client tls_client.HttpClient, shopURL string) (
 	bestPrice := math.MaxFloat64
 	found := false
 
+	// /collections/all/products.json is the only endpoint that honors
+	// sort_by — root /products.json silently ignores it (verified), so the
+	// sorted candidate goes first and its pagination inherits the sort.
 	urlsToTry := []string{
+		shopURL + "/collections/all/products.json?limit=250&sort_by=price-ascending",
 		shopURL + "/products.json?limit=250",
-		shopURL + "/products.json",
 	}
 
 	var lastStatus int
@@ -519,7 +522,8 @@ func findCheapestProductUncached(client tls_client.HttpClient, shopURL string) (
 		}
 
 		for page := 2; page <= 5; page++ {
-			pageURL := shopURL + fmt.Sprintf("/products.json?limit=250&page=%d", page)
+			// Inherit the winning base URL (and its sort) for pagination.
+			pageURL := reqURL + fmt.Sprintf("&page=%d", page)
 			pageBody, pageErr := fetchProductPage(client, pageURL, shopURL)
 			if pageErr != nil {
 				break
@@ -577,101 +581,167 @@ func findCheapestProductUncached(client tls_client.HttpClient, shopURL string) (
 // /api/graphql endpoint is not subject to the same per-route throttle as
 // /products.json, so burnt proxies can still fetch products + variant IDs +
 // prices here. Returns gid://shopify/... IDs stripped to their numeric part.
+//
+// The walk is sorted price-ascending (sortKey:PRICE), so page 1 contains the
+// store's cheapest products and cursor pagination covers up to 10 pages
+// (2500 products); the cheapest scanned available variant is the answer.
+// If the store's API rejects the sortKey arg, we retry unsorted and paginated
+// (best effort, same coverage as before but deeper).
 func findCheapestProductViaGraphQL(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
+	title, pid, vid, price, walkErr := walkGraphQLProductsCheapest(client, shopURL, ", sortKey:PRICE")
+	if walkErr == nil {
+		return title, pid, vid, price, nil
+	}
+	// Old API version may not know sortKey/available_for_sale — retry unsorted.
+	if strings.Contains(walkErr.Error(), "graphql errors") {
+		title, pid, vid, price, walkErr = walkGraphQLProductsCheapest(client, shopURL, "")
+		if walkErr == nil {
+			return title, pid, vid, price, nil
+		}
+	}
+	return "", "", "", "", walkErr
+}
+
+// walkGraphQLProductsCheapest walks the products connection cursor by cursor
+// and returns the cheapest purchasable variant. gqlArgs is inserted into the
+// products(...) call (e.g. ", sortKey:PRICE, available_for_sale:true").
+func walkGraphQLProductsCheapest(client tls_client.HttpClient, shopURL, gqlArgs string) (productTitle string, productID string, variantID string, priceStr string, err error) {
 	bestPrice := math.MaxFloat64
 	found := false
 
-	query := `{"query":"{ products(first:250) { edges { node { id title availableForSale variants(first:10) { edges { node { id title priceV2 { amount currencyCode } } } } } } } }"}`
+	const maxGQLPages = 10
+	var cursor string
 
-	req, reqErr := fhttp.NewRequest("POST", shopURL+"/api/graphql", strings.NewReader(query))
-	if reqErr != nil {
-		return "", "", "", "", fmt.Errorf("building graphql request: %w", reqErr)
-	}
-	req.Header.Set("accept", "application/json")
-	req.Header.Set("accept-language", "en-US,en;q=0.9")
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("origin", shopURL)
-	req.Header.Set("referer", shopURL+"/")
-	req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-	req.Header.Set("sec-fetch-dest", "empty")
-	req.Header.Set("sec-fetch-mode", "cors")
-	req.Header.Set("sec-fetch-site", "same-origin")
-	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-
-	resp, doErr := doWithRetry(client, req, 2)
-	if doErr != nil {
-		return "", "", "", "", fmt.Errorf("POST /api/graphql: %w", doErr)
-	}
-	defer resp.Body.Close()
-
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return "", "", "", "", fmt.Errorf("reading graphql response: %w", readErr)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("POST /api/graphql returned status %d", resp.StatusCode)
-	}
-
-	bodyStr := string(body)
-	if strings.Contains(bodyStr, `"errors"`) {
-		return "", "", "", "", fmt.Errorf("graphql errors: %s", truncateForLog(bodyStr, 300))
-	}
-
-	var gqlResp struct {
-		Data struct {
-			Products struct {
-				Edges []struct {
-					Node struct {
-						ID               string `json:"id"`
-						Title            string `json:"title"`
-						AvailableForSale bool   `json:"availableForSale"`
-						Variants         struct {
-							Edges []struct {
-								Node struct {
-									ID      string `json:"id"`
-									Title   string `json:"title"`
-									PriceV2 struct {
-										Amount       string `json:"amount"`
-										CurrencyCode string `json:"currencyCode"`
-									} `json:"priceV2"`
-								} `json:"node"`
-							} `json:"edges"`
-						} `json:"variants"`
-					} `json:"node"`
-				} `json:"edges"`
-			} `json:"products"`
-		} `json:"data"`
-	}
-	if jErr := json.Unmarshal(body, &gqlResp); jErr != nil {
-		return "", "", "", "", fmt.Errorf("graphql parse: %w (body: %s)", jErr, truncateForLog(bodyStr, 200))
-	}
-
-	for _, edge := range gqlResp.Data.Products.Edges {
-		p := edge.Node
-		if !p.AvailableForSale {
-			continue
+	for pageNum := 1; pageNum <= maxGQLPages; pageNum++ {
+		afterClause := ""
+		if cursor != "" {
+			afterClause = fmt.Sprintf(`, after:\"%s\"`, cursor)
 		}
-		pidGID := p.ID
-		pidTitle := p.Title
-		for _, ve := range p.Variants.Edges {
-			v := ve.Node
-			vidGID := v.ID
-			priceVal := v.PriceV2.Amount
-			price, convErr := strconv.ParseFloat(priceVal, 64)
-			if convErr != nil || price <= 0 {
+		query := fmt.Sprintf(`{"query":"{ products(first:250%s%s) { pageInfo { hasNextPage endCursor } edges { node { id title availableForSale variants(first:10) { edges { node { id title currentlyNotInStock priceV2 { amount currencyCode } } } } } } } }"}`, gqlArgs, afterClause)
+
+		req, reqErr := fhttp.NewRequest("POST", shopURL+"/api/graphql", strings.NewReader(query))
+		if reqErr != nil {
+			if found {
+				return productTitle, productID, variantID, priceStr, nil
+			}
+			return "", "", "", "", fmt.Errorf("building graphql request: %w", reqErr)
+		}
+		req.Header.Set("accept", "application/json")
+		req.Header.Set("accept-language", "en-US,en;q=0.9")
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("origin", shopURL)
+		req.Header.Set("referer", shopURL+"/")
+		req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+		req.Header.Set("sec-ch-ua-mobile", "?0")
+		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		req.Header.Set("sec-fetch-dest", "empty")
+		req.Header.Set("sec-fetch-mode", "cors")
+		req.Header.Set("sec-fetch-site", "same-origin")
+		req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+		resp, doErr := doWithRetry(client, req, 2)
+		if doErr != nil {
+			// Mid-walk failure: a cheaper variant from earlier pages is still
+			// valid — return the best found so far instead of failing the site.
+			if found {
+				return productTitle, productID, variantID, priceStr, nil
+			}
+			return "", "", "", "", fmt.Errorf("POST /api/graphql: %w", doErr)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			if found {
+				return productTitle, productID, variantID, priceStr, nil
+			}
+			return "", "", "", "", fmt.Errorf("reading graphql response: %w", readErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			if found {
+				return productTitle, productID, variantID, priceStr, nil
+			}
+			return "", "", "", "", fmt.Errorf("POST /api/graphql returned status %d", resp.StatusCode)
+		}
+
+		bodyStr := string(body)
+		// Field-level errors still return partial data — only bail when
+		// there is no data at all.
+		if strings.Contains(bodyStr, `"errors"`) && !strings.Contains(bodyStr, `"data"`) {
+			return "", "", "", "", fmt.Errorf("graphql errors: %s", truncateForLog(bodyStr, 300))
+		}
+
+		var gqlResp struct {
+			Data struct {
+				Products struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Edges []struct {
+						Node struct {
+							ID               string `json:"id"`
+							Title            string `json:"title"`
+							AvailableForSale bool   `json:"availableForSale"`
+							Variants         struct {
+								Edges []struct {
+									Node struct {
+										ID                  string `json:"id"`
+										Title               string `json:"title"`
+										CurrentlyNotInStock bool   `json:"currentlyNotInStock"`
+										PriceV2             struct {
+											Amount       string `json:"amount"`
+											CurrencyCode string `json:"currencyCode"`
+										} `json:"priceV2"`
+									} `json:"node"`
+								} `json:"edges"`
+							} `json:"variants"`
+						} `json:"node"`
+					} `json:"edges"`
+				} `json:"products"`
+			} `json:"data"`
+		}
+		if jErr := json.Unmarshal(body, &gqlResp); jErr != nil {
+			if found {
+				return productTitle, productID, variantID, priceStr, nil
+			}
+			return "", "", "", "", fmt.Errorf("graphql parse: %w (body: %s)", jErr, truncateForLog(bodyStr, 200))
+		}
+
+		for _, edge := range gqlResp.Data.Products.Edges {
+			p := edge.Node
+			if !p.AvailableForSale {
 				continue
 			}
-			if price < bestPrice {
-				bestPrice = price
-				variantID = stripGID(vidGID)
-				productID = stripGID(pidGID)
-				productTitle = pidTitle
-				priceStr = priceVal
-				found = true
+			pidGID := p.ID
+			pidTitle := p.Title
+			for _, ve := range p.Variants.Edges {
+				v := ve.Node
+				if v.CurrentlyNotInStock {
+					continue
+				}
+				vidGID := v.ID
+				priceVal := v.PriceV2.Amount
+				price, convErr := strconv.ParseFloat(priceVal, 64)
+				if convErr != nil || price <= 0 {
+					continue
+				}
+				if price < bestPrice {
+					bestPrice = price
+					variantID = stripGID(vidGID)
+					productID = stripGID(pidGID)
+					productTitle = pidTitle
+					priceStr = priceVal
+					found = true
+				}
 			}
 		}
+
+		// Stop if no more pages.
+		if !gqlResp.Data.Products.PageInfo.HasNextPage || gqlResp.Data.Products.PageInfo.EndCursor == "" {
+			break
+		}
+		cursor = gqlResp.Data.Products.PageInfo.EndCursor
 	}
 
 	if !found {
