@@ -119,6 +119,15 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 			w.db.UpdateSiteResult(site.ID, StatusError, "TRANSIENT", errMsg, 0)
 			return
 		}
+		// Checkout-state errors the flow itself flagged retryable (e.g.
+		// missing signedHandles/delivery handle — Shopify sometimes returns
+		// unresolved delivery strategies; the same store passes on a re-check).
+		// Error status so ClaimPendingSites retries it (check_count < 3).
+		if res != nil && res.Retryable {
+			log.Printf("[worker] RETRYABLE: %s (%s)", storeURL, errMsg)
+			w.db.UpdateSiteResult(site.ID, StatusError, "RETRYABLE", errMsg, 0)
+			return
+		}
 		// Everything else is a permanent site condition → dead.
 		log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
 		w.db.UpdateSiteResult(site.ID, StatusDead, "CHECK_FAILED", errMsg, 0)
