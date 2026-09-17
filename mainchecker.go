@@ -1940,22 +1940,50 @@ type Address struct {
 	Phone       string
 }
 
-var countryAddresses = map[string]Address{
-	"US": {FirstName: "james", LastName: "anderson", Address1: "428 st", Address2: "apt", City: "New York", CountryCode: "US", ZoneCode: "NY", PostalCode: "10080", Phone: "+12125550100"},
-	"CA": {FirstName: "james", LastName: "anderson", Address1: "200 Kent St", Address2: "", City: "Ottawa", CountryCode: "CA", ZoneCode: "ON", PostalCode: "K1A 0G9", Phone: "+16135550100"},
-	"GB": {FirstName: "james", LastName: "anderson", Address1: "10 Downing St", Address2: "", City: "London", CountryCode: "GB", ZoneCode: "ENG", PostalCode: "SW1A 2AA", Phone: "+442012345678"},
-	"AU": {FirstName: "james", LastName: "anderson", Address1: "1 George St", Address2: "", City: "Sydney", CountryCode: "AU", ZoneCode: "NSW", PostalCode: "2000", Phone: "+61212345678"},
-	"DE": {FirstName: "james", LastName: "anderson", Address1: "Friedrichstr 100", Address2: "", City: "Berlin", CountryCode: "DE", ZoneCode: "BE", PostalCode: "10117", Phone: "+493012345678"},
-	"FR": {FirstName: "james", LastName: "anderson", Address1: "10 Rue de Rivoli", Address2: "", City: "Paris", CountryCode: "FR", ZoneCode: "", PostalCode: "75001", Phone: "+33112345678"},
-	"NZ": {FirstName: "james", LastName: "anderson", Address1: "1 Queen St", Address2: "", City: "Auckland", CountryCode: "NZ", ZoneCode: "AUK", PostalCode: "1010", Phone: "+6491234567"},
-	"IE": {FirstName: "james", LastName: "anderson", Address1: "1 Grafton St", Address2: "", City: "Dublin", CountryCode: "IE", ZoneCode: "D", PostalCode: "D02 Y006", Phone: "+35311234567"},
+// Real, deliverable addresses. Fake streets ("428 st") can fail Shopify's
+// rate lookup entirely — UnavailableTerms → no delivery strategy → no
+// signedHandles → checkout dies at step 10. Real addresses get rates for
+// every store that ships to the destination at all. A list per country so
+// consecutive checks can use different destinations.
+var countryAddresses = map[string][]Address{
+	"US": {
+		{FirstName: "james", LastName: "anderson", Address1: "350 Fifth Avenue", Address2: "", City: "New York", CountryCode: "US", ZoneCode: "NY", PostalCode: "10118", Phone: "+12125550100"},
+		{FirstName: "james", LastName: "anderson", Address1: "233 S Wacker Dr", Address2: "", City: "Chicago", CountryCode: "US", ZoneCode: "IL", PostalCode: "60606", Phone: "+13125550100"},
+		{FirstName: "james", LastName: "anderson", Address1: "410 Terry Ave N", Address2: "", City: "Seattle", CountryCode: "US", ZoneCode: "WA", PostalCode: "98109", Phone: "+12065550100"},
+		{FirstName: "james", LastName: "anderson", Address1: "5808 Sunset Blvd", Address2: "", City: "Los Angeles", CountryCode: "US", ZoneCode: "CA", PostalCode: "90028", Phone: "+12135550100"},
+		{FirstName: "james", LastName: "anderson", Address1: "3570 S Las Vegas Blvd", Address2: "", City: "Las Vegas", CountryCode: "US", ZoneCode: "NV", PostalCode: "89109", Phone: "+17025550100"},
+		{FirstName: "james", LastName: "anderson", Address1: "333 Eldert St", Address2: "", City: "Brooklyn", CountryCode: "US", ZoneCode: "NY", PostalCode: "11237", Phone: "+17185550100"},
+	},
+	"CA": {
+		{FirstName: "james", LastName: "anderson", Address1: "200 Kent St", Address2: "", City: "Ottawa", CountryCode: "CA", ZoneCode: "ON", PostalCode: "K1A 0G9", Phone: "+16135550100"},
+		{FirstName: "james", LastName: "anderson", Address1: "301 Front St W", Address2: "", City: "Toronto", CountryCode: "CA", ZoneCode: "ON", PostalCode: "M5V 2T6", Phone: "+14165550100"},
+	},
+	"GB": {
+		{FirstName: "james", LastName: "anderson", Address1: "1 Poultry", Address2: "", City: "London", CountryCode: "GB", ZoneCode: "ENG", PostalCode: "EC2R 8EJ", Phone: "+442012345678"},
+	},
+	"AU": {
+		{FirstName: "james", LastName: "anderson", Address1: "1 Martin Pl", Address2: "", City: "Sydney", CountryCode: "AU", ZoneCode: "NSW", PostalCode: "2000", Phone: "+61212345678"},
+	},
+	"DE": {
+		{FirstName: "james", LastName: "anderson", Address1: "Friedrichstr 100", Address2: "", City: "Berlin", CountryCode: "DE", ZoneCode: "BE", PostalCode: "10117", Phone: "+493012345678"},
+	},
+	"FR": {
+		{FirstName: "james", LastName: "anderson", Address1: "10 Rue de Rivoli", Address2: "", City: "Paris", CountryCode: "FR", ZoneCode: "", PostalCode: "75001", Phone: "+33112345678"},
+	},
+	"NZ": {
+		{FirstName: "james", LastName: "anderson", Address1: "1 Queen St", Address2: "", City: "Auckland", CountryCode: "NZ", ZoneCode: "AUK", PostalCode: "1010", Phone: "+6491234567"},
+	},
+	"IE": {
+		{FirstName: "james", LastName: "anderson", Address1: "1 Grafton St", Address2: "", City: "Dublin", CountryCode: "IE", ZoneCode: "D", PostalCode: "D02 Y006", Phone: "+35311234567"},
+	},
 }
 
 func addressForCountry(country string) Address {
-	if addr, ok := countryAddresses[country]; ok {
-		return addr
+	addrs, ok := countryAddresses[country]
+	if !ok || len(addrs) == 0 {
+		addrs = countryAddresses["US"]
 	}
-	return countryAddresses["US"]
+	return addrs[rand.Intn(len(addrs))]
 }
 
 func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email string, addr Address, currency, country string) (int, string, error) {

@@ -1548,66 +1548,88 @@ type cityTemplate struct {
 	City       string
 	ZoneCode   string
 	PostalCode string
+	Street     string // real, deliverable street; empty → random fake street
 }
 
+// Real landmark addresses: fake streets ("123 Main St") can fail Shopify's
+// rate lookup entirely (especially stores on carrier-calculated rates), which
+// returns UnavailableTerms — no delivery strategy, no signedHandles, and the
+// whole checkout dies at step 10. Real deliverable addresses get rates for
+// every store that ships to the destination at all.
 var countryCities = map[string][]cityTemplate{
 	"US": {
-		{"New York", "NY", "10001"}, {"Los Angeles", "CA", "90001"},
-		{"Chicago", "IL", "60601"}, {"Houston", "TX", "77001"},
-		{"Phoenix", "AZ", "85001"}, {"Philadelphia", "PA", "19101"},
-		{"San Diego", "CA", "92101"}, {"Dallas", "TX", "75201"},
-		{"San Jose", "CA", "95101"}, {"Austin", "TX", "78701"},
-		{"Jacksonville", "FL", "32201"}, {"Columbus", "OH", "43085"},
-		{"Indianapolis", "IN", "46201"}, {"Seattle", "WA", "98101"},
-		{"Denver", "CO", "80201"}, {"Boston", "MA", "02101"},
-		{"Detroit", "MI", "48201"}, {"Nashville", "TN", "37201"},
-		{"Portland", "OR", "97201"}, {"Las Vegas", "NV", "89101"},
-		{"Milwaukee", "WI", "53201"}, {"Albuquerque", "NM", "87101"},
-		{"Tucson", "AZ", "85701"}, {"Fresno", "CA", "93701"},
-		{"Sacramento", "CA", "95801"}, {"Kansas City", "MO", "64101"},
-		{"Mesa", "AZ", "85201"}, {"Atlanta", "GA", "30301"},
-		{"Miami", "FL", "33101"}, {"Minneapolis", "MN", "55401"},
+		{"New York", "NY", "10118", "350 Fifth Avenue"},
+		{"Los Angeles", "CA", "90028", "5808 Sunset Blvd"},
+		{"Chicago", "IL", "60606", "233 S Wacker Dr"},
+		{"Houston", "TX", "77002", "1 Toyota Center"},
+		{"Phoenix", "AZ", "85004", "1 E Washington St"},
+		{"Philadelphia", "PA", "19148", "1 Citizens Bank Park Dr"},
+		{"San Diego", "CA", "92101", "100 Park Blvd"},
+		{"Dallas", "TX", "75219", "2500 Victory Ave"},
+		{"San Jose", "CA", "95113", "200 E Santa Clara St"},
+		{"Austin", "TX", "78701", "800 Congress Ave"},
+		{"Jacksonville", "FL", "32202", "1 Independent Dr"},
+		{"Columbus", "OH", "43215", "250 W Nationwide Blvd"},
+		{"Indianapolis", "IN", "46225", "400 S Meridian St"},
+		{"Seattle", "WA", "98109", "410 Terry Ave N"},
+		{"Denver", "CO", "80205", "2001 Blake St"},
+		{"Boston", "MA", "02133", "24 Beacon St"},
+		{"Detroit", "MI", "48226", "500 Griswold St"},
+		{"Nashville", "TN", "37203", "501 Broadway"},
+		{"Portland", "OR", "97227", "1 N Center Ct St"},
+		{"Las Vegas", "NV", "89109", "3570 S Las Vegas Blvd"},
+		{"Milwaukee", "WI", "53214", "1 Brewers Way"},
+		{"Albuquerque", "NM", "87102", "1 Civic Plaza NW"},
+		{"Tucson", "AZ", "85701", "260 S Church Ave"},
+		{"Fresno", "CA", "93721", "848 M St"},
+		{"Sacramento", "CA", "95814", "1400 J St"},
+		{"Kansas City", "MO", "64105", "301 W 13th St"},
+		{"Mesa", "AZ", "85201", "1 E Main St"},
+		{"Atlanta", "GA", "30313", "1 AMB Drive NW"},
+		{"Miami", "FL", "33132", "601 Biscayne Blvd"},
+		{"Minneapolis", "MN", "55403", "600 N 1st Ave"},
+		{"Brooklyn", "NY", "11237", "333 Eldert St"},
 	},
 	"CA": {
-		{"Toronto", "ON", "M5H 2N2"}, {"Ottawa", "ON", "K1A 0G9"},
-		{"Vancouver", "BC", "V6B 1A1"}, {"Montreal", "QC", "H2Z 1A7"},
-		{"Calgary", "AB", "T2P 1J9"}, {"Edmonton", "AB", "T5J 1J9"},
-		{"Winnipeg", "MB", "R3C 0V8"}, {"Halifax", "NS", "B3J 1S9"},
+		{"Toronto", "ON", "M5V 2T6", "301 Front St W"}, {"Ottawa", "ON", "K2H 1C2", "200 Katherine St"},
+		{"Vancouver", "BC", "V6C 3B6", "1055 Canada Pl"}, {"Montreal", "QC", "H2Y 1C6", "1 Place Ville Marie"},
+		{"Calgary", "AB", "T2P 2M5", "620 6 Ave SW"}, {"Edmonton", "AB", "T5J 2R6", "10230 97 St NW"},
+		{"Winnipeg", "MB", "R3C 3H6", "201 Portage Ave"}, {"Halifax", "NS", "B3J 2R6", "1891 Upper Water St"},
 	},
 	"GB": {
-		{"London", "ENG", "SW1A 1AA"}, {"Manchester", "ENG", "M1 1AE"},
-		{"Birmingham", "ENG", "B1 1AA"}, {"Leeds", "ENG", "LS1 1AA"},
-		{"Liverpool", "ENG", "L1 1AA"}, {"Bristol", "ENG", "BS1 1AA"},
-		{"Sheffield", "ENG", "S1 1AA"}, {"Edinburgh", "SCT", "EH1 1AA"},
-		{"Glasgow", "SCT", "G1 1AA"}, {"Cardiff", "WLS", "CF10 1AA"},
+		{"London", "ENG", "EC2M 4AA", "1 Poultry"}, {"Manchester", "ENG", "M2 3WQ", "1 St Peter's Square"},
+		{"Birmingham", "ENG", "B2 4PA", "1 Colmore Row"}, {"Leeds", "ENG", "LS1 4DY", "1 Park Row"},
+		{"Liverpool", "ENG", "L1 8LR", "1 Princes Parade"}, {"Bristol", "ENG", "BS1 6DE", "1 Redcliffe Way"},
+		{"Sheffield", "ENG", "S1 2HE", "1 Pinstone St"}, {"Edinburgh", "SCT", "EH1 1BB", "1 Hanover St"},
+		{"Glasgow", "SCT", "G1 1XQ", "1 Royal Exchange Sq"}, {"Cardiff", "WLS", "CF10 1EP", "1 Colum Rd"},
 	},
 	"AU": {
-		{"Sydney", "NSW", "2000"}, {"Melbourne", "VIC", "3000"},
-		{"Brisbane", "QLD", "4000"}, {"Perth", "WA", "6000"},
-		{"Adelaide", "SA", "5000"}, {"Canberra", "ACT", "2600"},
-		{"Hobart", "TAS", "7000"}, {"Darwin", "NT", "0800"},
+		{"Sydney", "NSW", "2000", "1 Martin Pl"}, {"Melbourne", "VIC", "3000", "1 Collins St"},
+		{"Brisbane", "QLD", "4000", "1 Eagle St"}, {"Perth", "WA", "6000", "1 St Georges Tce"},
+		{"Adelaide", "SA", "5000", "1 King William St"}, {"Canberra", "ACT", "2601", "1 London Circuit"},
+		{"Hobart", "TAS", "7000", "1 Elizabeth St"}, {"Darwin", "NT", "0800", "1 Smith St"},
 	},
 	"DE": {
-		{"Berlin", "BE", "10117"}, {"Hamburg", "HH", "20095"},
-		{"Munich", "BY", "80331"}, {"Cologne", "NW", "50667"},
-		{"Frankfurt", "HE", "60311"}, {"Stuttgart", "BW", "70173"},
-		{"Dusseldorf", "NW", "40210"}, {"Leipzig", "SN", "04109"},
+		{"Berlin", "BE", "10117", "Friedrichstraße 100"}, {"Hamburg", "HH", "20095", "Königstraße 100"},
+		{"Munich", "BY", "80331", "Sendlinger Straße 1"}, {"Cologne", "NW", "50667", "Hohe Straße 1"},
+		{"Frankfurt", "HE", "60311", "Zeil 1"}, {"Stuttgart", "BW", "70173", "Königstraße 1"},
+		{"Dusseldorf", "NW", "40210", "Königsallee 1"}, {"Leipzig", "SN", "04109", "Brühl 1"},
 	},
 	"FR": {
-		{"Paris", "IDF", "75001"}, {"Marseille", "PAC", "13001"},
-		{"Lyon", "ARA", "69001"}, {"Toulouse", "OCC", "31000"},
-		{"Nice", "PAC", "06000"}, {"Nantes", "PDL", "44000"},
-		{"Bordeaux", "NAQ", "33000"}, {"Lille", "HDF", "59000"},
+		{"Paris", "IDF", "75001", "10 Rue de Rivoli"}, {"Marseille", "PAC", "13001", "10 La Canebière"},
+		{"Lyon", "ARA", "69001", "10 Rue de la République"}, {"Toulouse", "OCC", "31000", "10 Rue du Taur"},
+		{"Nice", "PAC", "06000", "10 Avenue Jean Médecin"}, {"Nantes", "PDL", "44000", "10 Rue Crébillon"},
+		{"Bordeaux", "NAQ", "33000", "10 Rue Sainte-Catherine"}, {"Lille", "HDF", "59000", "10 Rue Nationale"},
 	},
 	"NZ": {
-		{"Auckland", "AUK", "1010"}, {"Wellington", "WGN", "6011"},
-		{"Christchurch", "CAN", "8011"}, {"Hamilton", "WKO", "3204"},
-		{"Tauranga", "BOP", "3110"}, {"Dunedin", "OTA", "9016"},
+		{"Auckland", "AUK", "1010", "1 Queen St"}, {"Wellington", "WGN", "6011", "1 Jervois Rd"},
+		{"Christchurch", "CAN", "8011", "1 Cathedral Sq"}, {"Hamilton", "WKO", "3204", "1 Victoria St"},
+		{"Tauranga", "BOP", "3110", "1 Devonport Rd"}, {"Dunedin", "OTA", "9016", "1 Princes St"},
 	},
 	"IE": {
-		{"Dublin", "D", "D02 Y006"}, {"Cork", "C", "T12 X8HR"},
-		{"Galway", "G", "H91 X0EE"}, {"Limerick", "LK", "V94 R1X2"},
-		{"Waterford", "WD", "X91 Y1A0"}, {"Drogheda", "LD", "A92 R6X2"},
+		{"Dublin", "D", "D02 Y006", "1 Grafton St"}, {"Cork", "C", "T12 X8HR", "1 Grand Parade"},
+		{"Galway", "G", "H91 X0EE", "1 Eyre Sq"}, {"Limerick", "LK", "V94 R1X2", "1 O'Connell St"},
+		{"Waterford", "WD", "X91 Y1A0", "1 Michael St"}, {"Drogheda", "LD", "A92 R6X2", "1 West St"},
 	},
 }
 
@@ -1673,10 +1695,14 @@ func addressForCountry(country string) Address {
 		country = "US"
 	}
 	city := cities[rand.Intn(len(cities))]
-	streetNum := 1 + rand.Intn(9999)
-	street := streetNames[rand.Intn(len(streetNames))]
+	street := city.Street
+	if street == "" {
+		// Fallback: random fake street (only for countries without a
+		// curated real address).
+		street = fmt.Sprintf("%d %s", 1+rand.Intn(9999), streetNames[rand.Intn(len(streetNames))])
+	}
 	return Address{
-		Address1:    fmt.Sprintf("%d %s", streetNum, street),
+		Address1:    street,
 		Address2:    "",
 		City:        city.City,
 		CountryCode: country,

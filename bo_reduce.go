@@ -457,7 +457,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 	randSleep(0.2, 0.5)
 	stepStart("8·proposal5", "")
 	var proposal5Body string
-	for p5Attempt := 1; p5Attempt <= 2; p5Attempt++ {
+	for p5Attempt := 1; p5Attempt <= 3; p5Attempt++ {
 		// Attempt 1 re-selects the known handle. Attempt 2 falls back to
 		// MatchingConditions: Shopify only issues signedHandle signatures in
 		// the response when the buyer lets it resolve the strategy, so a
@@ -469,12 +469,19 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 			if qt := extractQueueToken(proposal5Body); qt != "" {
 				qTok = qt
 			}
-			fmt.Println("[P5] proposal5 missing signedHandles — retrying with MatchingConditions")
+			// Also switch to a different deliverable address: Shopify
+			// returns no rates at all (UnavailableTerms → no signedHandles)
+			// for destinations outside the store's shipping zones or when
+			// the rate lookup rejects the address.
+			addr = addressForCountry(country)
+			addr.FirstName = firstName
+			addr.LastName = lastName
+			fmt.Printf("[P5] proposal5 missing signedHandles — retrying with new address (%s, %s) + MatchingConditions\n", addr.City, addr.CountryCode)
 			randSleep(1.5, 2.5)
 		}
 		p5Status, p5Body, p5Err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, qTok, email, addr, currency, country, p5Handle, proxyURL)
 		if p5Err != nil {
-			if p5Attempt == 2 {
+			if p5Attempt == 3 {
 				result.Status = BoError
 				result.Error = fmt.Errorf("Step 8 failed: %w", p5Err)
 				return result, result.Error
@@ -531,6 +538,16 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 	}
 	signedHandles := extractSignedHandles(proposal5Body)
 	if len(signedHandles) == 0 {
+		// Distinguish the two failure causes: Shopify returns
+		// "UnavailableTerms" when it has NO rates for the destination at
+		// all (verified via real-browser checkout — some stores genuinely
+		// cannot ship), vs an unresolved strategy race.
+		if strings.Contains(proposal5Body, `"__typename":"UnavailableTerms"`) {
+			result.Status = BoError
+			result.Error = fmt.Errorf("%w: Step 10 failed: store cannot ship to destination (shipping not available)", errStoreIncompatible)
+			result.Retryable = true
+			return result, result.Error
+		}
 		result.Status = BoError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract signedHandles", errStoreIncompatible)
 		result.Retryable = true
