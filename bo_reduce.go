@@ -454,7 +454,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 		return result, result.Error
 	}
 
-	randSleep(0.2, 0.5)
+	randSleep(2.0, 3.5)
 	stepStart("8·proposal5", "")
 	var proposal5Body string
 	for p5Attempt := 1; p5Attempt <= 3; p5Attempt++ {
@@ -469,15 +469,21 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 			if qt := extractQueueToken(proposal5Body); qt != "" {
 				qTok = qt
 			}
-			// Also switch to a different deliverable address: Shopify
-			// returns no rates at all (UnavailableTerms → no signedHandles)
-			// for destinations outside the store's shipping zones or when
-			// the rate lookup rejects the address.
-			addr = addressForCountry(country)
-			addr.FirstName = firstName
-			addr.LastName = lastName
-			fmt.Printf("[P5] proposal5 missing signedHandles — retrying with new address (%s, %s) + MatchingConditions\n", addr.City, addr.CountryCode)
-			randSleep(1.5, 2.5)
+			// The seller proposal reports PendingTerms{pollDelay:500,taskId}
+			// while rates are still resolving — the fix is to POLL: re-propose
+			// with the SAME address so resolution continues (attempt 2).
+			// Attempt 3 switches to a different deliverable address in case
+			// the original destination is outside the store's zones.
+			if p5Attempt == 3 {
+				addr = addressForCountry(country)
+				addr.FirstName = firstName
+				addr.LastName = lastName
+				fmt.Printf("[P5] proposal5 missing signedHandles — retrying with new address (%s, %s) + MatchingConditions\n", addr.City, addr.CountryCode)
+				randSleep(4.0, 6.0)
+			} else {
+				fmt.Println("[P5] proposal5 missing signedHandles — re-polling same address with MatchingConditions")
+				randSleep(3.0, 4.5)
+			}
 		}
 		p5Status, p5Body, p5Err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, qTok, email, addr, currency, country, p5Handle, proxyURL)
 		if p5Err != nil {
@@ -538,13 +544,22 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 	}
 	signedHandles := extractSignedHandles(proposal5Body)
 	if len(signedHandles) == 0 {
-		// Distinguish the two failure causes: Shopify returns
-		// "UnavailableTerms" when it has NO rates for the destination at
-		// all (verified via real-browser checkout — some stores genuinely
-		// cannot ship), vs an unresolved strategy race.
-		if strings.Contains(proposal5Body, `"__typename":"UnavailableTerms"`) {
+		// Distinguish the failure causes via the SELLER proposal's delivery
+		// terms: PendingTerms = resolution still in flight (poll later),
+		// UnavailableTerms = no rates possible for the destination (some
+		// stores genuinely cannot ship — verified via real-browser
+		// checkout). UnavailableTerms also appears in the buyer section of
+		// successful responses, so scope to the sellerProposal section.
+		sellerSeg := sellerProposalSection(proposal5Body)
+		if strings.Contains(sellerSeg, `"delivery":{"__typename":"UnavailableTerms"`) {
 			result.Status = BoError
 			result.Error = fmt.Errorf("%w: Step 10 failed: store cannot ship to destination (shipping not available)", errStoreIncompatible)
+			result.Retryable = true
+			return result, result.Error
+		}
+		if strings.Contains(sellerSeg, `"__typename":"PendingTerms"`) {
+			result.Status = BoError
+			result.Error = fmt.Errorf("%w: Step 10 failed: delivery rates still pending after retries", errStoreIncompatible)
 			result.Retryable = true
 			return result, result.Error
 		}

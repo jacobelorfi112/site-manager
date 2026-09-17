@@ -2989,7 +2989,10 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 
 	// Step 8
-	time.Sleep(200 * time.Millisecond)
+	// Shopify resolves delivery rates asynchronously after the address
+	// proposals — give it a beat before proposal5 or its response comes
+	// back with unresolved strategies (no signedHandles).
+	time.Sleep(2500 * time.Millisecond)
 	proposal5Status, proposal5Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken4, email, addr, currency, country)
 	if err != nil {
 		result.Status = StatusError
@@ -3039,6 +3042,18 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 	signedHandles := extractSignedHandles(proposal5Body)
 	if len(signedHandles) == 0 {
+		// Shopify's SELLER proposal returns "delivery":{"__typename":
+		// "UnavailableTerms"} while rates are not resolved yet; some stores
+		// never resolve it (verified via real-browser checkout — genuinely
+		// cannot ship to any address). Scope to the sellerProposal section:
+		// UnavailableTerms also appears in the buyer section of successful
+		// responses.
+		if strings.Contains(sellerProposalSection(proposal5Body), `"delivery":{"__typename":"UnavailableTerms"`) {
+			result.Status = StatusError
+			result.Error = fmt.Errorf("%w: Step 10 failed: store cannot ship to destination (shipping not available)", errStoreIncompatible)
+			result.Retryable = true
+			return result, result.Error
+		}
 		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract signedHandles", errStoreIncompatible)
 		result.Retryable = true
