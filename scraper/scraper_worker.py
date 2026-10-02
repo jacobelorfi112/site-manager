@@ -11,11 +11,11 @@ Environment variables:
 """
 
 import json
+import os
 import random
 import sys
 import time
 import urllib.parse as up
-
 import requests
 
 from dork_parser import run_shopify_dork, SHOPIFY_DORKS_FILE, SHOPIFY_DELAY, MAX_PAGES
