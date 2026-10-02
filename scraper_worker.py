@@ -31,6 +31,8 @@ import requests
 urllib3.disable_warnings()
 
 # ── Config ──────────────────────────────────────────────────────────
+SCRAPER_VERSION    = "3.0.0-cfworker"
+
 SITE_MANAGER_URL   = "https://cf-site-manager.anonchat-notlak3.workers.dev"
 DATABASE_URL       = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE         = int(os.environ.get("SCRAPER_BATCH_SIZE", "100"))
@@ -315,7 +317,7 @@ def main():
             "Set it to your site-manager's Railway URL, e.g.:\n"
             "  https://site-manager-production-xxxx.up.railway.app"
         )
-    print("Scraper Worker starting", flush=True)
+    print(f"Scraper Worker v{SCRAPER_VERSION} starting", flush=True)
     print(f"  Site Manager: {SITE_MANAGER_URL}", flush=True)
     print(f"  Sources: RapidDNS, HackerTarget, urlscan.io, DNSRepo, SiteDossier, CommonCrawl", flush=True)
     print(f"  Requests per cycle: {REQUESTS_PER_CYCLE}", flush=True)
