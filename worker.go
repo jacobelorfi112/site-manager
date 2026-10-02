@@ -104,6 +104,10 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 			res.StatusCode == "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" {
 			log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
 			w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("checkout works (%s)", res.StatusCode), price)
+			// Store quality signals for the /sites/good filter.
+			if res.EnabledCardBrands != "" || res.SingleCurrency {
+				w.db.UpdateSiteQuality(site.ID, res.EnabledCardBrands, res.SingleCurrency)
+			}
 			return
 		}
 	}

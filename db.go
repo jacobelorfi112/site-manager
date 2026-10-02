@@ -24,16 +24,18 @@ const (
 
 // Site is a row in the sites table.
 type Site struct {
-	ID            int64      `json:"id"`
-	URL           string     `json:"url"`
-	Status        SiteStatus `json:"status"`
-	ErrorCode     string     `json:"error_code,omitempty"`
-	ErrorMsg      string     `json:"error_message,omitempty"`
-	CheckoutPrice float64    `json:"checkout_price"`
-	CheckCount    int        `json:"check_count"`
-	LastChecked   *time.Time `json:"last_checked,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID                int64      `json:"id"`
+	URL               string     `json:"url"`
+	Status            SiteStatus `json:"status"`
+	ErrorCode         string     `json:"error_code,omitempty"`
+	ErrorMsg          string     `json:"error_message,omitempty"`
+	CheckoutPrice     float64    `json:"checkout_price"`
+	EnabledCardBrands string     `json:"enabled_card_brands,omitempty"`
+	SingleCurrency    bool       `json:"single_currency"`
+	CheckCount        int        `json:"check_count"`
+	LastChecked       *time.Time `json:"last_checked,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 // DB wraps the database connection.
@@ -87,6 +89,8 @@ func (db *DB) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_sites_url ON sites(url);
 		-- Add column if upgrading from older schema
 		ALTER TABLE sites ADD COLUMN IF NOT EXISTS checkout_price NUMERIC(10,2) NOT NULL DEFAULT 0;
+		ALTER TABLE sites ADD COLUMN IF NOT EXISTS enabled_card_brands TEXT NOT NULL DEFAULT '';
+		ALTER TABLE sites ADD COLUMN IF NOT EXISTS single_currency BOOLEAN NOT NULL DEFAULT false;
 	`)
 	return err
 }
@@ -175,6 +179,17 @@ func (db *DB) UpdateSiteResult(id int64, status SiteStatus, errorCode, errorMsg 
 		    check_count = check_count + 1, last_checked = NOW(), updated_at = NOW()
 		WHERE id = $5
 	`, status, errorCode, errorMsg, checkoutPrice, id)
+	return err
+}
+
+// UpdateSiteQuality stores the checkout-derived quality signals (card brand
+// filter + currency config) for a verified working site. Called after the
+// checkout HTML has been parsed.
+func (db *DB) UpdateSiteQuality(id int64, enabledCardBrands string, singleCurrency bool) error {
+	_, err := db.conn.Exec(`
+		UPDATE sites SET enabled_card_brands = $1, single_currency = $2, updated_at = NOW()
+		WHERE id = $3
+	`, enabledCardBrands, singleCurrency, id)
 	return err
 }
 
@@ -287,6 +302,47 @@ func (db *DB) Close() error {
 func (db *DB) DeleteSite(id int64) error {
 	_, err := db.conn.Exec(`DELETE FROM sites WHERE id = $1`, id)
 	return err
+}
+
+// GetGoodSites returns working sites that accept ALL card brands
+// (enabled_card_brands is empty) AND run in a single USD currency.
+// These are the stores most likely to process cards successfully.
+func (db *DB) GetGoodSites(limit, offset int) ([]Site, int, error) {
+	where := `WHERE status = 'working' AND single_currency = true
+	          AND (enabled_card_brands = '[]' OR enabled_card_brands = '')`
+	var total int
+	err := db.conn.QueryRow(`SELECT COUNT(*) FROM sites `+where).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	args := []interface{}{limit, offset}
+	rows, err := db.conn.Query(fmt.Sprintf(`
+		SELECT id, url, status, error_code, error_msg, checkout_price, enabled_card_brands, single_currency,
+		       check_count, last_checked, created_at, updated_at
+		FROM sites %s
+		ORDER BY checkout_price ASC
+		LIMIT $1 OFFSET $2
+	`, where), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var sites []Site
+	for rows.Next() {
+		var s Site
+		var lastChecked sql.NullTime
+		if err := rows.Scan(&s.ID, &s.URL, &s.Status, &s.ErrorCode, &s.ErrorMsg,
+			&s.CheckoutPrice, &s.EnabledCardBrands, &s.SingleCurrency,
+			&s.CheckCount, &lastChecked, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		if lastChecked.Valid {
+			s.LastChecked = &lastChecked.Time
+		}
+		sites = append(sites, s)
+	}
+	return sites, total, rows.Err()
 }
 
 // RecheckAllSites resets ALL sites back to pending for re-validation.

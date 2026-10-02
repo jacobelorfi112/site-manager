@@ -25,6 +25,15 @@ func RegisterSiteRoutes(mux *http.ServeMux, db *DB) {
 	mux.HandleFunc("/sites/working", func(w http.ResponseWriter, r *http.Request) {
 		handleWorkingSites(w, r, db)
 	})
+	mux.HandleFunc("/sites/good", func(w http.ResponseWriter, r *http.Request) {
+		handleGoodSites(w, r, db)
+	})
+	mux.HandleFunc("/sites/good/count", func(w http.ResponseWriter, r *http.Request) {
+		handleGoodSitesCount(w, r, db)
+	})
+	mux.HandleFunc("/sites/good/export", func(w http.ResponseWriter, r *http.Request) {
+		handleGoodSitesExport(w, r, db)
+	})
 	mux.HandleFunc("/sites/stats", func(w http.ResponseWriter, r *http.Request) {
 		handleStats(w, r, db)
 	})
@@ -437,9 +446,20 @@ h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
 	fmt.Fprintf(w, `<div class="stat error"><div class="num">%d</div><div class="label">Errors</div></div>`, stats["error"])
 	fmt.Fprintf(w, `<div class="stat working"><div class="num">%d</div><div class="label">Working ≤$15</div></div>`, under15)
 
+	// Good stores count (fetch live)
+	goodCount := 0
+	goodSites, goodTotal, gerr := db.GetGoodSites(1, 0)
+	if gerr == nil {
+		goodCount = goodTotal
+		_ = goodSites
+	}
+	fmt.Fprintf(w, `<div class="stat working" style="border-color: #27ae60;"><div class="num" id="goodCount" data-url="/sites/good/count">%d</div><div class="label">⭐ Good Stores</div></div>`, goodCount)
+
 	fmt.Fprint(w, `</div>
 <div class="refresh">
 <a href="/sites/dashboard">↻ Refresh</a> &nbsp; <a href="/sites/export">⬇ Export TXT</a> &nbsp;
+<a href="/sites/good/export">⭐ Download Good Stores</a> &nbsp;
+<a href="/sites/good">⭐ View Good Stores JSON</a> &nbsp;
 <a href="#" onclick="recheckAll(); return false;" class="btn-recheck">🔄 Recheck All Sites</a>
 </div>`)
 
@@ -531,4 +551,71 @@ setInterval(function(){
 }, 30000);
 </script>
 </body></html>`)
+}
+
+// GET /sites/good?limit=&offset= — working stores with empty enabled_card_brands
+// (accepts all brands) AND single USD currency. The high-probability pool.
+func handleGoodSites(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 500
+	offset := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {
+			limit = n
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	sites, total, err := db.GetGoodSites(limit, offset)
+	if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total": total, "limit": limit, "offset": offset, "sites": sites,
+	})
+}
+
+// GET /sites/good/count — lightweight count for the dashboard.
+func handleGoodSitesCount(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	sites, total, err := db.GetGoodSites(1, 0)
+	if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	sample := ""
+	if len(sites) > 0 {
+		sample = sites[0].URL
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"total": total, "sample": sample})
+}
+
+// GET /sites/good/export — download good stores as "URL | $price" plain text.
+func handleGoodSitesExport(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	sites, _, err := db.GetGoodSites(100000, 0)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Disposition", "attachment; filename=good_sites.txt")
+	for _, s := range sites {
+		fmt.Fprintf(w, "%s | $%.2f\n", s.URL, s.CheckoutPrice)
+	}
 }

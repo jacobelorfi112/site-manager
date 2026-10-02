@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"html"
 	"math/rand"
 	"regexp"
 	"strconv"
@@ -87,16 +88,18 @@ const (
 )
 
 type BoCheckResult struct {
-	Card       string
-	Status     BoCheckStatus
-	StatusCode string
-	Amount     string
-	Currency   string
-	SiteName   string
-	ShopURL    string
-	Gateway    string
-	Error      error
-	Retryable  bool
+	Card              string
+	Status            BoCheckStatus
+	StatusCode        string
+	Amount            string
+	Currency          string
+	SiteName          string
+	ShopURL           string
+	Gateway           string
+	Error             error
+	Retryable         bool
+	EnabledCardBrands string
+	SingleCurrency    bool
 }
 
 var proposalErrorRe = regexp.MustCompile(`"code"\s*:\s*"([^"]+)"\s*,\s*"localizedMessage"\s*:\s*"[^"]*"\s*,\s*"nonLocalizedMessage"\s*:\s*"([^"]*)"`)
@@ -279,6 +282,9 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 		siteName = strings.TrimPrefix(strings.TrimPrefix(shopURL, "https://"), "http://")
 		result.SiteName = siteName
 	}
+
+	// Extract store quality signals from the checkout SSR state.
+	result.EnabledCardBrands, result.SingleCurrency = extractStoreQualitySignals(checkoutHTML)
 	stableID := extractStableID(checkoutHTML)
 	buildID := extractCommitSha(checkoutHTML)
 	sourceToken := extractSourceToken(checkoutHTML)
@@ -805,4 +811,39 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 			return result, result.Error
 		}
 	}
+}
+
+// extractStoreQualitySignals parses the checkout SSR HTML for the two
+// store-quality signals:
+//   - enabled_card_brands: empty array "[]" = accepts ALL card brands (good);
+//     a populated array means the store restricts which brands it processes.
+//   - single_currency: the checkout only offers the store's base currency
+//     (USD) — multi-currency stores route cards through conversion + extra
+//     3DS/risk paths which increase declines.
+func extractStoreQualitySignals(checkoutHTML string) (cardBrands string, singleCurrency bool) {
+	un := html.UnescapeString(checkoutHTML)
+
+	// enabled_card_brands
+	ecbRe := regexp.MustCompile(`"enabled_card_brands":\s*(\[[^\]]*\])`)
+	if m := ecbRe.FindStringSubmatch(un); len(m) > 1 {
+		cardBrands = strings.TrimSpace(m[1])
+	}
+
+	// single_currency: count distinct presentment currencies in the SSR.
+	// Multi-currency stores embed a large list; single-currency stores
+	// have just their base currency (USD).
+	pcrRe := regexp.MustCompile(`"enabledPresentmentCurrencies":\s*\[([^\]]*)\]`)
+	if m := pcrRe.FindStringSubmatch(un); len(m) > 1 {
+		nCodes := strings.Count(m[1], `"`) / 2
+		singleCurrency = nCodes <= 1 && strings.Contains(m[1], "USD")
+	} else {
+		// Fallback: if the field isn't in the SSR, check if the checkout
+		// only references USD (single-currency stores never show other
+		// currency codes in the payment section).
+		singleCurrency = strings.Contains(un, `"presentmentCurrency":"USD"`) &&
+			!strings.Contains(un, `"presentmentCurrency":"EUR"`) &&
+			!strings.Contains(un, `"presentmentCurrency":"GBP"`) &&
+			!strings.Contains(un, `"presentmentCurrency":"CAD"`)
+	}
+	return
 }
