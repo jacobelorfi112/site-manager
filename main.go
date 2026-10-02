@@ -21,9 +21,7 @@ func main() {
 
 	CFWorkerURL = os.Getenv("CF_WORKER_URL")
 	if CFWorkerURL == "" {
-		log.Fatal("CF_WORKER_URL environment variable is not set.\n" +
-			"Set it to your Cloudflare Worker URL, e.g.:\n" +
-			"  https://cf-site-manager.anonchat-notlak3.workers.dev")
+		CFWorkerURL = "https://cf-site-manager.anonchat-notlak3.workers.dev"
 	}
 	fmt.Printf("CF Worker connected: %s\n", CFWorkerURL)
 
