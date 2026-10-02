@@ -185,6 +185,20 @@ func (w *SiteCheckWorker) checkSite(site cfSite) {
 		if res != nil && res.StatusCode != "" {
 			errMsg = res.StatusCode + ": " + errMsg
 		}
+
+		// Structural gateway failures — the store has NO card payment gateway.
+		// These can NEVER charge, regardless of card quality. Mark as dead
+		// immediately so they don't waste retry slots.
+		if res != nil && res.StatusCode != "" {
+			if strings.Contains(res.StatusCode, "PAYMENTS_METHOD") ||
+				strings.Contains(res.StatusCode, "PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE") ||
+				strings.Contains(res.StatusCode, "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED") {
+				log.Printf("[worker] DEAD (no card gateway): %s (%s)", storeURL, errMsg)
+				w.api.postResult(storeURL, "dead", res.StatusCode, errMsg, 0, "", false)
+				return
+			}
+		}
+
 		if isTransientErr(err) {
 			log.Printf("[worker] RETRYABLE: %s (%s)", storeURL, errMsg)
 			w.api.postResult(storeURL, "error", "TRANSIENT", errMsg, 0, "", false)

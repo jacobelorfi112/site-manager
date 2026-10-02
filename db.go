@@ -306,12 +306,12 @@ func (db *DB) DeleteSite(id int64) error {
 	return err
 }
 
-// GetGoodSites returns working sites that accept ALL card brands
-// (enabled_card_brands is empty) AND run in a single USD currency.
-// These are the stores most likely to process cards successfully.
+// GetGoodSites returns working sites that are single-currency (USD only)
+// with checkout_price <= $10. These are the stores most likely to process
+// cards successfully (89% of charged stores are single-currency USD).
 func (db *DB) GetGoodSites(limit, offset int) ([]Site, int, error) {
 	where := `WHERE status = 'working' AND single_currency = true
-	          AND (enabled_card_brands = '[]' OR enabled_card_brands = '')`
+	          AND checkout_price <= 10`
 	var total int
 	err := db.conn.QueryRow(`SELECT COUNT(*) FROM sites `+where).Scan(&total)
 	if err != nil {
