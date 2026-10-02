@@ -254,6 +254,8 @@ def parse_brave(html):
 _neosearch_xsrf_token = ''
 _neosearch_token_fetched = 0
 NEOSEARCH_TOKEN_REFRESH = 300  # refresh token every 5 min
+NEO_COOLDOWN_SECS = int(os.environ.get('NEO_COOLDOWN_SECS', '90'))  # cooldown after 429
+_neo_cooldown_until = 0
 
 
 def _neosearch_get_token():
@@ -295,7 +297,9 @@ def parse_neosearch(content):
 def fetch_neosearch(dork, page=1):
     """NeoSearch API — no proxies needed, no 429s, returns 16-20 Shopify URLs/dork.
     Supports site: dorks. Uses XSRF token from homepage."""
-    global _neosearch_xsrf_token, _neosearch_token_fetched
+    global _neosearch_xsrf_token, _neosearch_token_fetched, _neo_cooldown_until
+    if time.time() < _neo_cooldown_until:
+        return [], 'cooldown'
     if not _neosearch_xsrf_token or (time.time() - _neosearch_token_fetched > NEOSEARCH_TOKEN_REFRESH):
         if not _neosearch_get_token():
             return [], 'no-token'
@@ -315,6 +319,9 @@ def fetch_neosearch(dork, page=1):
                               impersonate='chrome120', timeout=20)
         if r.status_code == 200:
             return parse_neosearch(r.text), 'OK'
+        if r.status_code == 429:
+            _neo_cooldown_until = time.time() + NEO_COOLDOWN_SECS
+            return [], '429'
         if r.status_code == 403 or r.status_code == 502:
             # Cloudflare block — refresh token and retry once
             if _neosearch_get_token():
@@ -369,6 +376,80 @@ def fetch_brave(dork, page=1):
             # Clear bad proxies so they get retried after cooldown
             _proxy_bad.clear()
             return [], '429'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
+
+
+def _extract_shopify(html):
+    """Extract all URLs from HTML, percent-decode, keep anything shopify-ish.
+    Works for direct hrefs (paulgo/naver) and wrapped RU= links (yahoo/baidu)."""
+    decoded = up.unquote(html)
+    urls = re.findall(r'https?://[A-Za-z0-9\-\.]+\.myshopify\.com[^\s"\'<>,)\]]*', decoded)
+    return urls
+
+
+def fetch_paulgo(dork, page=1):
+    """paulgo.io (public SearXNG) — 20 Shopify URLs/dork, no captcha, no rate limit
+    at ~1 req/s. Supports site: dorks. Paginates via &pageno=N."""
+    url = 'https://paulgo.io/search?q=' + up.quote(dork) + '&pageno=%d' % page
+    try:
+        r = curl_requests.get(url, impersonate='chrome124', timeout=20)
+        if r.status_code == 200:
+            return _extract_shopify(r.text), 'OK'
+        if r.status_code == 429:
+            time.sleep(3)
+            return [], '429'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
+
+
+def fetch_yahoo(dork, page=1):
+    """Yahoo (Bing index) — paginates via &b=offset, no captcha, 5-10 Shopify URLs/page."""
+    url = 'https://search.yahoo.com/search?p=' + up.quote(dork) + '&b=%d' % ((page - 1) * 10 + 1)
+    try:
+        r = curl_requests.get(url, impersonate='chrome124', timeout=20)
+        if r.status_code == 200:
+            return _extract_shopify(r.text), 'OK'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
+
+
+def fetch_naver(dork, page=1):
+    """Naver (Korean) — 20 Shopify URLs/page, no captcha. &page=N pagination."""
+    url = 'https://search.naver.com/search.naver?query=' + up.quote(dork) + '&page=%d' % page
+    try:
+        r = curl_requests.get(url, impersonate='chrome124', timeout=20)
+        if r.status_code == 200:
+            return _extract_shopify(r.text), 'OK'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
+
+
+def fetch_baidu(dork, page=1):
+    """Baidu (Chinese) — 5-10 Shopify URLs/page, no captcha. &pn=offset pagination."""
+    url = 'https://www.baidu.com/s?wd=' + up.quote(dork) + '&pn=%d' % ((page - 1) * 10)
+    try:
+        r = curl_requests.get(url, impersonate='chrome124', timeout=20)
+        if r.status_code == 200:
+            return _extract_shopify(r.text), 'OK'
+        return [], 'HTTP %d' % r.status_code
+    except Exception as e:
+        return [], '%s' % e.__class__.__name__
+
+
+def fetch_bing_rss(dork, page=1):
+    """Bing RSS endpoint — lightweight XML, rarely blocked. Weak yield (2-5/page)."""
+    url = 'https://www.bing.com/search?q=' + up.quote(dork) + '&format=rss&count=30'
+    if page > 1:
+        url += '&first=%d' % ((page - 1) * 30 + 1)
+    try:
+        r = curl_requests.get(url, impersonate='chrome124', timeout=20)
+        if r.status_code == 200:
+            return _extract_shopify(r.text), 'OK'
         return [], 'HTTP %d' % r.status_code
     except Exception as e:
         return [], '%s' % e.__class__.__name__
@@ -445,80 +526,74 @@ def _shopify_kept(urls):
     return [n for u in urls if (n := norm_url(u)) and shopify_ok(n)]
 
 
+# Engine chain — round-robin START engine per dork so no single engine takes
+# the full request rate (that's what killed NeoSearch after ~100 rapid queries).
+ENGINE_ORDER = ['paulgo', 'neosearch', 'yahoo', 'naver', 'baidu', 'bing_rss']
+if os.environ.get('BRAVE_ENABLED', '0') == '1':
+    ENGINE_ORDER.insert(len(ENGINE_ORDER) - 1, 'brave')
+ENGINE_FETCHERS = {
+    'paulgo': fetch_paulgo,
+    'neosearch': fetch_neosearch,
+    'yahoo': fetch_yahoo,
+    'naver': fetch_naver,
+    'baidu': fetch_baidu,
+    'brave': fetch_brave,
+    'bing_rss': fetch_bing_rss,
+}
+ENGINE_LABELS = {
+    'paulgo': 'Paul', 'neosearch': 'Neo', 'yahoo': 'YH', 'naver': 'NV',
+    'baidu': 'BD', 'brave': 'Brave', 'bing_rss': 'BRSS',
+}
+_engine_rr_idx = 0
+PAGES_PER_ENGINE = int(os.environ.get('PAGES_PER_ENGINE', '3'))  # pagination depth per dork
+
+
 def run_shopify_dork(dork):
-    """NeoSearch (primary, no proxy needed) -> Brave (proxy) -> Bing (fallback).
+    """Round-robin engine chain. Each dork starts with a different engine and
+    paginates it until dry; falls through to the next engine only on failure.
     Returns (kept_by_engine: dict, status_str)."""
-    got = {e: [] for e in ENGINE_KEYS + ['brave', 'neosearch']}
+    global _engine_rr_idx
+    got = {e: [] for e in set(ENGINE_ORDER) | {'brave'}}
     parts = []
 
-    # NeoSearch PRIMARY: no proxies needed, no 429s, 16-20 Shopify URLs/dork.
-    # Supports site: dorks. Works from any IP (including Render).
-    neo_urls, neo_status = fetch_neosearch(dork)
-    got['neosearch'] = _shopify_kept(neo_urls)
-    if neo_status == 'OK':
-        parts.append('Neo:OK(%d)' % len(got['neosearch']))
-    else:
-        parts.append('Neo:%s(%d)' % (neo_status, len(got['neosearch'])))
+    order = ENGINE_ORDER[_engine_rr_idx:] + ENGINE_ORDER[:_engine_rr_idx]
+    _engine_rr_idx = (_engine_rr_idx + 1) % len(ENGINE_ORDER)
 
-    # Brave SECONDARY: if NeoSearch found nothing, try Brave with proxy rotation
-    if not any(got.values()):
-        brave_urls = []
+    for eng in order:
+        if eng == 'brave' and os.environ.get('BRAVE_ENABLED', '0') != '1':
+            continue
+        fetch = ENGINE_FETCHERS[eng]
+        label = ENGINE_LABELS[eng]
+        all_urls = []
         page = 1
-        while True:
-            urls, status = fetch_brave(dork, page=page)
-            if status == 'cooldown':
+        while page <= PAGES_PER_ENGINE:
+            if eng == 'neosearch' and time.time() < _neo_cooldown_until:
+                parts.append('%s:cooldown' % label)
+                break
+            if eng == 'brave' and time.time() < _brave_cooldown_until:
                 wait_secs = int(_brave_cooldown_until - time.time())
                 if wait_secs > 0:
-                    print(f'    [Brave cooldown] waiting {wait_secs}s...', flush=True)
-                    time.sleep(wait_secs)
-                continue
-            if status == 'OK' and urls:
-                brave_urls.extend(urls)
-            else:
-                parts.append('Brave:%s(%d)' % (status, 0))
+                    time.sleep(min(wait_secs, 10))
                 break
-            if MAX_PAGES and page >= MAX_PAGES:
+            try:
+                urls, status = fetch(dork, page=page)
+            except Exception as e:
+                parts.append('%s:ERR(%s)' % (label, e.__class__.__name__))
                 break
-            if not MAX_PAGES and page >= 5:
+            if status != 'OK':
+                parts.append('%s:%s(0)' % (label, status))
                 break
+            kept = _shopify_kept(urls)
+            if not kept:
+                break  # page dry — engine exhausted for this dork
+            all_urls.extend(urls)
             page += 1
-            time.sleep(1)
-        got['brave'] = _shopify_kept(brave_urls)
-        if brave_urls:
-            parts.append('Brave:OK(%d)' % len(got['brave']))
-
-    # Bing FALLBACK: only when both NeoSearch and Brave found nothing
-    if not any(got.values()):
-        bing_urls = []
-        empty_shopify_pages = 0
-        page = 1
-        while True:
-            urls, status = run_engine_quick('bing', dork, page=page)
-            if status == 'OK' and urls:
-                bing_urls.extend(urls)
-                kept = _shopify_kept(urls)
-                if kept:
-                    empty_shopify_pages = 0
-                else:
-                    empty_shopify_pages += 1
-                    if empty_shopify_pages >= 3:
-                        break
-            else:
-                break
-            if MAX_PAGES and page >= MAX_PAGES:
-                break
-            if not MAX_PAGES and page >= 20:
-                break
-            page += 1
-            time.sleep(1)
-        got['bing'] = _shopify_kept(bing_urls)
-        parts.append('Bing:%s(%d)' % ('OK' if bing_urls else '0', len(got['bing'])))
-
-    # DDG fallback — DISABLED. Re-enable with env var USE_DDG=1 if needed.
-    if not any(got.values()) and os.environ.get('USE_DDG', '0') == '1':
-        urls, status = run_engine_quick('duckduckgo', dork)
-        got['duckduckgo'] = _shopify_kept(urls)
-        parts.append('DDG:%s(%d)' % (status, len(got['duckduckgo'])))
+            if page <= PAGES_PER_ENGINE:
+                time.sleep(0.7)
+        got[eng] = _shopify_kept(all_urls)
+        if got[eng]:
+            parts.append('%s:OK(%d)' % (label, len(got[eng])))
+            break  # success — stop trying other engines
     return got, '  '.join(parts)
 
 
