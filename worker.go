@@ -1,38 +1,121 @@
+//go:build cfworker
+
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// SiteCheckWorker continuously pulls pending sites from the DB and runs
+// CFWorkerURL is the Cloudflare Worker that replaces the PostgreSQL database.
+// Set via the CF_WORKER_URL env var.
+var CFWorkerURL string
+
+// cfSite is the JSON structure matching the CF Worker's site response.
+type cfSite struct {
+	ID                int64  `json:"id"`
+	URL               string `json:"url"`
+	Status            string `json:"status"`
+	CheckoutPrice     float64
+	EnabledCardBrands string `json:"enabled_card_brands"`
+	SingleCurrency    bool   `json:"single_currency"`
+}
+
+// cfAPIClient wraps HTTP calls to the CF Worker.
+type cfAPIClient struct {
+	http *http.Client
+}
+
+func newCFAPIClient() *cfAPIClient {
+	return &cfAPIClient{http: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// claimPendingSites fetches N pending sites from the CF Worker.
+func (c *cfAPIClient) claimPendingSites(batch int) ([]cfSite, error) {
+	resp, err := c.http.Get(CFWorkerURL + "/sites/claim?batch=" + strconv.Itoa(batch))
+	if err != nil {
+		return nil, fmt.Errorf("claim request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("claim returned %d: %s", resp.StatusCode, string(body)[:min(len(body), 200)])
+	}
+	var r struct {
+		Sites []cfSite `json:"sites"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("claim parse: %w", err)
+	}
+	sites := make([]cfSite, len(r.Sites))
+	for i, s := range r.Sites {
+		sites[i] = cfSite{ID: s.ID, URL: s.URL}
+	}
+	return sites, nil
+}
+
+// postResult posts the check result back to the CF Worker.
+func (c *cfAPIClient) postResult(url, status, errorCode, errorMsg string, price float64, cardBrands string, singleCurrency bool) error {
+	payload := map[string]interface{}{
+		"url":                url,
+		"status":             status,
+		"error_code":         errorCode,
+		"error_msg":          errorMsg,
+		"checkout_price":     price,
+		"enabled_card_brands": cardBrands,
+		"single_currency":    singleCurrency,
+	}
+	body, _ := json.Marshal(payload)
+	resp, err := c.http.Post(CFWorkerURL+"/sites/result", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("result post: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("result returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// resetStuckChecking resets sites stuck in "checking" for too long.
+// The CF Worker handles this via a timestamp check — we just call the endpoint.
+func (c *cfAPIClient) resetStuckChecking() error {
+	resp, err := c.http.Post(CFWorkerURL+"/sites/recheck-all", "application/json", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// SiteCheckWorker continuously pulls pending sites from the CF Worker and runs
 // a full checkout with a test card. If the site returns INCORRECT_NUMBER,
 // the checkout flow works → site is marked working.
 type SiteCheckWorker struct {
-	db        *DB
+	api       *cfAPIClient
 	batchSize int
 }
 
-// NewSiteCheckWorker creates a background worker.
-func NewSiteCheckWorker(db *DB, batchSize int) *SiteCheckWorker {
+// NewSiteCheckWorker creates a background worker (CF Worker API mode).
+func NewSiteCheckWorker(api *cfAPIClient, batchSize int) *SiteCheckWorker {
 	if batchSize <= 0 {
 		batchSize = 20
 	}
-	return &SiteCheckWorker{db: db, batchSize: batchSize}
+	return &SiteCheckWorker{api: api, batchSize: batchSize}
 }
 
 // Run starts the worker loop. Call in a goroutine.
 func (w *SiteCheckWorker) Run(stop <-chan struct{}) {
-	log.Println("[worker] Site check worker started")
-
-	// Reset any sites stuck in "checking" from previous crashes
-	if n, err := w.db.ResetStuckChecking(); err == nil && n > 0 {
-		log.Printf("[worker] Reset %d stuck sites back to pending", n)
-	}
+	log.Println("[worker] Site check worker started (CF Worker API mode)")
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -49,12 +132,7 @@ func (w *SiteCheckWorker) Run(stop <-chan struct{}) {
 }
 
 func (w *SiteCheckWorker) processBatch() {
-	// Reset stuck sites periodically
-	if n, err := w.db.ResetStuckChecking(); err == nil && n > 0 {
-		log.Printf("[worker] Reset %d stuck sites", n)
-	}
-
-	sites, err := w.db.ClaimPendingSites(w.batchSize)
+	sites, err := w.api.claimPendingSites(w.batchSize)
 	if err != nil {
 		log.Printf("[worker] Error claiming sites: %v", err)
 		return
@@ -68,7 +146,7 @@ func (w *SiteCheckWorker) processBatch() {
 	var wg sync.WaitGroup
 	for _, site := range sites {
 		wg.Add(1)
-		go func(s Site) {
+		go func(s cfSite) {
 			defer wg.Done()
 			w.checkSite(s)
 		}(site)
@@ -76,19 +154,15 @@ func (w *SiteCheckWorker) processBatch() {
 	wg.Wait()
 }
 
-// checkSite runs bo-main's TLS Shopify checkout against the site with a test
-// card (proxyless). If the checkout gets far enough to reject the card
-// (BoDeclined), the full pipeline works → site is working. Dead/broken sites
-// are removed.
-func (w *SiteCheckWorker) checkSite(site Site) {
+// checkSite runs the checkout against the site with a test card.
+func (w *SiteCheckWorker) checkSite(site cfSite) {
 	storeURL := site.URL
-	// Fake card — triggers a card decision (BoDeclined) only if the checkout works.
 	const testCardEntry = "5524860214037312|10|28|950"
 
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[worker] PANIC checking %s: %v", storeURL, r)
-			w.db.UpdateSiteResult(site.ID, StatusError, "PANIC", fmt.Sprintf("%v", r), 0)
+			w.api.postResult(storeURL, "error", "PANIC", fmt.Sprintf("%v", r), 0, "", false)
 		}
 	}()
 
@@ -96,18 +170,12 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 	if res != nil {
 		price := parseAmountString(res.Amount)
 
-		// Card decision reached (declined / approved / charged / brand rejected) →
-		// the checkout pipeline works end-to-end → site is WORKING. bo-main
-		// returns declined results together with an error, so this must be
-		// checked before err.
 		if res.Status == BoDeclined || res.Status == BoApproved || res.Status == BoCharged ||
 			res.StatusCode == "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" {
 			log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
-			w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("checkout works (%s)", res.StatusCode), price)
-			// Store quality signals for the /sites/good filter.
-			if res.EnabledCardBrands != "" || res.SingleCurrency {
-				w.db.UpdateSiteQuality(site.ID, res.EnabledCardBrands, res.SingleCurrency)
-			}
+			w.api.postResult(storeURL, "working", "CHECKOUT_VERIFIED",
+				fmt.Sprintf("checkout works (%s)", res.StatusCode), price,
+				res.EnabledCardBrands, res.SingleCurrency)
 			return
 		}
 	}
@@ -117,45 +185,33 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 		if res != nil && res.StatusCode != "" {
 			errMsg = res.StatusCode + ": " + errMsg
 		}
-		// Genuine transient network errors → error status, will retry.
 		if isTransientErr(err) {
 			log.Printf("[worker] RETRYABLE: %s (%s)", storeURL, errMsg)
-			w.db.UpdateSiteResult(site.ID, StatusError, "TRANSIENT", errMsg, 0)
+			w.api.postResult(storeURL, "error", "TRANSIENT", errMsg, 0, "", false)
 			return
 		}
-		// Checkout-state errors the flow itself flagged retryable (e.g.
-		// missing signedHandles/delivery handle — Shopify sometimes returns
-		// unresolved delivery strategies; the same store passes on a re-check).
-		// Error status so ClaimPendingSites retries it (check_count < 3).
 		if res != nil && res.Retryable {
 			log.Printf("[worker] RETRYABLE: %s (%s)", storeURL, errMsg)
-			w.db.UpdateSiteResult(site.ID, StatusError, "RETRYABLE", errMsg, 0)
+			w.api.postResult(storeURL, "error", "RETRYABLE", errMsg, 0, "", false)
 			return
 		}
-		// Everything else is a permanent site condition → dead.
 		log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
-		w.db.UpdateSiteResult(site.ID, StatusDead, "CHECK_FAILED", errMsg, 0)
+		w.api.postResult(storeURL, "dead", "CHECK_FAILED", errMsg, 0, "", false)
 		return
 	}
 	if res == nil {
 		log.Printf("[worker] ERROR: %s (nil result)", storeURL)
-		w.db.UpdateSiteResult(site.ID, StatusError, "NIL_RESULT", "nil result from checkout", 0)
+		w.api.postResult(storeURL, "error", "NIL_RESULT", "nil result from checkout", 0, "", false)
 		return
 	}
 
 	price := parseAmountString(res.Amount)
 
-	// BoDeclined = card rejected at payment → checkout pipeline works → site valid.
-	if res.Status == BoDeclined {
+	if res.Status == BoDeclined || res.Status == BoApproved || res.Status == BoCharged {
 		log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
-		w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("full checkout works ($%.2f)", price), price)
-		return
-	}
-
-	// BoApproved (3DS) / BoCharged (order placed) also prove the pipeline works.
-	if res.Status == BoApproved || res.Status == BoCharged {
-		log.Printf("[worker] WORKING: %s ($%.2f) [%s]", storeURL, price, res.StatusCode)
-		w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("checkout works (%s)", res.StatusCode), price)
+		w.api.postResult(storeURL, "working", "CHECKOUT_VERIFIED",
+			fmt.Sprintf("full checkout works ($%.2f)", price), price,
+			res.EnabledCardBrands, res.SingleCurrency)
 		return
 	}
 
@@ -164,11 +220,10 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 		errMsg = "unknown"
 	}
 	log.Printf("[worker] DEAD: %s (%s)", storeURL, errMsg)
-	w.db.UpdateSiteResult(site.ID, StatusDead, "CHECK_FAILED", errMsg, 0)
+	w.api.postResult(storeURL, "dead", "CHECK_FAILED", errMsg, 0, "", false)
 }
 
-// parseAmountString extracts a float amount from a currency-prefixed string
-// like "$12.34", "12.34", or "USD 12.34".
+// parseAmountString extracts a float amount from a currency-prefixed string.
 func parseAmountString(s string) float64 {
 	s = strings.TrimSpace(s)
 	if s == "" {

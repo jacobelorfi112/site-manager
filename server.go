@@ -8,15 +8,11 @@ import (
 )
 
 // StartServer starts the HTTP API server on the given address.
-func StartServer(addr string, db *DB) {
+// In CF Worker mode, the Go binary only serves /health and the checker worker.
+// The dashboard and site management API live on the CF Worker.
+func StartServer(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
-
-	// Register site management routes if DB is available
-	if db != nil {
-		RegisterSiteRoutes(mux, db)
-		log.Println("Site management API enabled")
-	}
 
 	srv := &http.Server{
 		Addr:        addr,

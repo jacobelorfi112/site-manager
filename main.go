@@ -1,3 +1,5 @@
+//go:build cfworker
+
 package main
 
 import (
@@ -10,7 +12,6 @@ import (
 )
 
 func main() {
-	// HTTP port — Render/Railway set PORT env var
 	port := "8080"
 	if v := os.Getenv("PORT"); v != "" {
 		port = v
@@ -18,21 +19,14 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	// Connect to PostgreSQL (optional — if DATABASE_URL not set, site management is disabled)
-	var db *DB
-	if os.Getenv("DATABASE_URL") != "" {
-		var err error
-		db, err = NewDB()
-		if err != nil {
-			log.Fatalf("Failed to connect to database: %v", err)
-		}
-		defer db.Close()
-		fmt.Println("Database connected, site management enabled")
-	} else {
-		fmt.Println("DATABASE_URL not set — site management disabled")
+	CFWorkerURL = os.Getenv("CF_WORKER_URL")
+	if CFWorkerURL == "" {
+		log.Fatal("CF_WORKER_URL environment variable is not set.\n" +
+			"Set it to your Cloudflare Worker URL, e.g.:\n" +
+			"  https://cf-site-manager.anonchat-notlak3.workers.dev")
 	}
+	fmt.Printf("CF Worker connected: %s\n", CFWorkerURL)
 
-	// Worker batch size
 	batchSize := 20
 	if v := os.Getenv("WORKER_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -40,26 +34,20 @@ func main() {
 		}
 	}
 
-	// Start background site check worker if DB is available
 	stopWorker := make(chan struct{})
-	if db != nil {
-		worker := NewSiteCheckWorker(db, batchSize)
-		go worker.Run(stopWorker)
-		fmt.Println("Site check worker started")
-	}
+	api := newCFAPIClient()
+	worker := NewSiteCheckWorker(api, batchSize)
+	go worker.Run(stopWorker)
+	fmt.Println("Site check worker started")
 
-	// Graceful shutdown
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
 		fmt.Println("\nShutting down...")
 		close(stopWorker)
-		if db != nil {
-			db.Close()
-		}
 		os.Exit(0)
 	}()
 
-	StartServer(":"+port, db)
+	StartServer(":" + port)
 }
