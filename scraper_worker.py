@@ -26,13 +26,12 @@ import time
 import random
 
 import urllib3
-import psycopg2
-import psycopg2.extras
 import requests
 
 urllib3.disable_warnings()
 
 # ── Config ──────────────────────────────────────────────────────────
+SITE_MANAGER_URL   = os.environ.get("SITE_MANAGER_URL", "")
 DATABASE_URL       = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE         = int(os.environ.get("SCRAPER_BATCH_SIZE", "100"))
 REQUESTS_PER_CYCLE = int(os.environ.get("SCRAPER_REQUESTS", "30"))
@@ -246,77 +245,95 @@ def scrape_cycle(num_requests: int, seen: set[str]) -> set[str]:
     return found
 
 
-# ── Database ─────────────────────────────────────────────────────────
+# ── Site Manager API (replaces direct DB access — no DATABASE_URL needed) ──
 
-def connect_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = False
-    return conn
+_api_session: requests.Session | None = None
 
-
-def ensure_schema(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS sites (
-                id             BIGSERIAL PRIMARY KEY,
-                url            TEXT NOT NULL UNIQUE,
-                status         TEXT NOT NULL DEFAULT 'pending',
-                error_code     TEXT NOT NULL DEFAULT '',
-                error_msg      TEXT NOT NULL DEFAULT '',
-                checkout_price NUMERIC(10,2) NOT NULL DEFAULT 0,
-                check_count    INTEGER NOT NULL DEFAULT 0,
-                last_checked   TIMESTAMPTZ,
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_sites_status ON sites(status);
-            CREATE INDEX IF NOT EXISTS idx_sites_url    ON sites(url);
-        """)
-    conn.commit()
+def _api() -> requests.Session:
+    global _api_session
+    if _api_session is None:
+        _api_session = requests.Session()
+        _api_session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+    return _api_session
 
 
-def insert_sites(conn, urls: list[str]) -> int:
+def ensure_schema():
+    """No-op — the Go site-manager handles schema migrations."""
+    pass
+
+
+def insert_sites(urls: list[str]) -> int:
+    """POST discovered store URLs to the site-manager's /sites/add endpoint."""
     if not urls:
         return 0
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            "INSERT INTO sites (url) VALUES %s ON CONFLICT (url) DO NOTHING",
-            [(u,) for u in urls],
-            page_size=500,
-        )
-        added = cur.rowcount
-    conn.commit()
-    return added
+    r = _api().post(f"{SITE_MANAGER_URL}/sites/add", json={"urls": urls}, timeout=30)
+    if r.status_code == 200:
+        return r.json().get("added", 0)
+    print(f"[API] /sites/add returned {r.status_code}: {r.text[:120]}", flush=True)
+    return 0
 
 
-def get_stats(conn) -> dict:
-    with conn.cursor() as cur:
-        cur.execute("SELECT status, COUNT(*) FROM sites GROUP BY status")
-        rows = cur.fetchall()
-    stats = {row[0]: row[1] for row in rows}
-    stats["total"] = sum(stats.values())
-    return stats
+def get_stats() -> dict:
+    """GET /sites/stats for the dashboard counters."""
+    try:
+        r = _api().get(f"{SITE_MANAGER_URL}/sites/stats", timeout=15)
+        if r.status_code == 200:
+            stats = r.json().get("by_status", {})
+            stats["total"] = r.json().get("total", sum(stats.values()))
+            return stats
+    except Exception:
+        pass
+    return {"total": 0, "pending": 0, "working": 0}
+
+
+def get_existing_urls() -> set[str]:
+    """Fetch all known URLs from the site-manager to avoid re-discovery."""
+    seen: set[str] = set()
+    offset = 0
+    while True:
+        try:
+            r = _api().get(f"{SITE_MANAGER_URL}/sites/working?limit=1000&offset={offset}", timeout=30)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            for s in data.get("sites", []):
+                seen.add(s.get("url", ""))
+            if offset + 1000 >= data.get("total", 0):
+                break
+            offset += 1000
+        except Exception:
+            break
+    return seen
 
 
 # ── Main loop ───────────────────────────────────────────────────────
 
 def main():
+    if not SITE_MANAGER_URL:
+        raise RuntimeError(
+            "SITE_MANAGER_URL environment variable is not set.\n"
+            "Set it to your site-manager's Railway URL, e.g.:\n"
+            "  https://site-manager-production-xxxx.up.railway.app"
+        )
     print("Scraper Worker starting", flush=True)
+    print(f"  Site Manager: {SITE_MANAGER_URL}", flush=True)
     print(f"  Sources: RapidDNS, HackerTarget, urlscan.io, DNSRepo, SiteDossier, CommonCrawl", flush=True)
     print(f"  Requests per cycle: {REQUESTS_PER_CYCLE}", flush=True)
     print(f"  Cycle delay: {CYCLE_DELAY}s", flush=True)
 
-    conn = connect_db()
-    print("Database connected", flush=True)
-    ensure_schema(conn)
+    # Verify site-manager is reachable
+    try:
+        r = _api().get(f"{SITE_MANAGER_URL}/sites/stats", timeout=15)
+        if r.status_code == 200:
+            print("Site Manager connected", flush=True)
+        else:
+            print(f"Site Manager returned {r.status_code} — continuing anyway", flush=True)
+    except Exception as e:
+        print(f"Site Manager unreachable: {e} — continuing anyway", flush=True)
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT url FROM sites")
-        seen: set[str] = {row[0] for row in cur.fetchall()}
-    print(f"Loaded {len(seen)} existing URLs from DB", flush=True)
+    ensure_schema()
+    seen = get_existing_urls()
+    print(f"Loaded {len(seen)} existing URLs from Site Manager", flush=True)
 
     cycle = 0
     total_found = 0
@@ -324,9 +341,9 @@ def main():
 
     while True:
         cycle += 1
-        stats = get_stats(conn)
+        stats = get_stats()
         print(f"\n{'='*55}", flush=True)
-        print(f"[Cycle {cycle}] DB: {stats['total']} total | "
+        print(f"[Cycle {cycle}] DB: {stats.get('total', 0)} total | "
               f"{stats.get('pending', 0)} pending | {stats.get('working', 0)} working", flush=True)
 
         found = scrape_cycle(REQUESTS_PER_CYCLE, seen)
@@ -337,7 +354,7 @@ def main():
 
         added = 0
         for i in range(0, len(new_urls), BATCH_SIZE):
-            added += insert_sites(conn, new_urls[i:i + BATCH_SIZE])
+            added += insert_sites(new_urls[i:i + BATCH_SIZE])
         total_added += added
 
         print(f"\n[Cycle {cycle}] Done — {len(found)} found, {added} new in DB", flush=True)
