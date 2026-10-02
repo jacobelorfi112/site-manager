@@ -86,7 +86,9 @@ def _cc_save_cursor():
 
 
 def _cc_fetch_page(index_id, page):
-    """Fetch one index page, return set of unique store roots. None on failure."""
+    """Fetch one index page. Returns (stores_set, status_code).
+    stores is None when the fetch failed; status_code tells why
+    (400/404 = beyond index end / missing index, 5xx = transient)."""
     url = (f"https://index.commoncrawl.org/{index_id}-index"
            f"?url=*.myshopify.com&output=json&page={page}")
     try:
@@ -94,10 +96,10 @@ def _cc_fetch_page(index_id, page):
                          headers={"User-Agent": "Mozilla/5.0 (compatible; site-scraper)"})
     except Exception as e:
         print(f"[CC] {index_id} page {page} error: {e.__class__.__name__}", flush=True)
-        return None
+        return None, 0
     if r.status_code != 200:
         print(f"[CC] {index_id} page {page} HTTP {r.status_code}", flush=True)
-        return None
+        return None, r.status_code
     stores = set()
     for line in r.text.splitlines():
         line = line.strip()
@@ -110,7 +112,7 @@ def _cc_fetch_page(index_id, page):
         s = normalize_store_url(u)
         if s and not s.startswith("https://www."):
             stores.add(s)
-    return stores
+    return stores, 200
 
 
 def harvest_common_crawl():
@@ -126,17 +128,30 @@ def harvest_common_crawl():
         idx = CC_INDEX_IDS[_cc_rr_idx % len(CC_INDEX_IDS)]
         _cc_rr_idx += 1
         page = _cc_cursors.get(idx, 0)
-        stores = _cc_fetch_page(idx, page)
+        stores, code = _cc_fetch_page(idx, page)
         if stores is None:
-            _cc_failures[idx] = _cc_failures.get(idx, 0) + 1
-            _cc_cursors[idx] = random.randint(0, 12)
-            # bad index (404) or end-of-index — drop it after 3 strikes
-            if _cc_failures[idx] >= 3:
-                print(f"[CC] dropping {idx} after {_cc_failures[idx]} failures", flush=True)
+            if code in (400, 404):
+                # Beyond end of index / index missing — crawl fully harvested.
+                # Drop it from rotation cleanly (no strike accumulation).
+                print(f"[CC] {idx}: index exhausted/missing (HTTP {code}) — dropping from rotation", flush=True)
                 CC_INDEX_IDS.remove(idx)
                 _cc_rr_idx = 0
                 if not CC_INDEX_IDS:
+                    print("[CC] all indexes exhausted — harvest idle until new crawl publishes", flush=True)
                     break
+            else:
+                # 5xx / network error = transient. Retry the SAME page next cycle;
+                # only skip the page after many consecutive failures (poison page).
+                _cc_failures[idx] = _cc_failures.get(idx, 0) + 1
+                if _cc_failures[idx] >= 5:
+                    print(f"[CC] {idx} page {page}: {code or 'error'} x{_cc_failures[idx]} — skipping page", flush=True)
+                    _cc_failures[idx] = 0
+                    _cc_cursors[idx] = page + 1
+                    if _cc_cursors[idx] >= _cc_max_page:
+                        _cc_cursors[idx] = random.randint(0, 12)
+                    _cc_save_cursor()
+                else:
+                    print(f"[CC] {idx} page {page}: transient ({code or 'error'}) — will retry next cycle", flush=True)
             continue
         _cc_failures[idx] = 0
         _cc_cursors[idx] = page + 1
