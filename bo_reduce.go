@@ -322,23 +322,14 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 		return result, result.Error
 	}
 
-	actionsURL := extractActionsJSURL(checkoutHTML, shopURL)
-	if actionsURL == "" {
+	stepStart("3·query-ids", "")
+	proposalID, submitID, pollForReceiptID, qErr := fetchPersistedQueryIDs(client, shopURL, checkoutHTML)
+	if qErr != nil {
 		result.Status = BoError
 		result.Retryable = true
-		result.Error = fmt.Errorf("Step 3 failed: could not find actions JS URL")
+		result.Error = fmt.Errorf("Step 3 failed: %w", qErr)
 		return result, result.Error
 	}
-	stepStart("3·actions-js", actionsURL)
-	jsBody, err := fetchActionsJS(client, actionsURL, shopURL)
-	if err != nil {
-		result.Status = BoError
-		result.Retryable = true
-		result.Error = fmt.Errorf("Step 3 failed: %w", err)
-		return result, result.Error
-	}
-	proposalID := extractProposalID(jsBody)
-	submitID := extractSubmitForCompletionID(jsBody)
 	if proposalID == "" || submitID == "" {
 		result.Status = BoError
 		result.Retryable = true
@@ -346,7 +337,6 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*BoCheckResult, er
 		return result, result.Error
 	}
 
-	pollForReceiptID := extractPollForReceiptID(jsBody)
 	if pollForReceiptID == "" {
 		processingURLs := extractProcessingJSURLs(checkoutHTML, shopURL)
 		tried := 0

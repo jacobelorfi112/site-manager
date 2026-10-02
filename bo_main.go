@@ -681,6 +681,121 @@ func extractActionsJSURL(checkoutHTML, shopURL string) string {
 	return shopURL + m[1]
 }
 
+// extractCheckoutChunkURLs lists every checkout-web JS chunk in the checkout
+// HTML (deduped, minus known-irrelevant assets like locales/polyfills).
+var boChunkSkipRe = regexp.MustCompile(`(?i)(locale-|polyfills|libphonenumber|qrcodegen|getCountryCallingCode|/css/|FullScreenBackground|component-[A-Z])`)
+
+func extractCheckoutChunkURLs(checkoutHTML, shopURL string) []string {
+	re := regexp.MustCompile(`(/cdn/shopifycloud/checkout-web/assets/c1/[A-Za-z0-9_.-]+\.js)`)
+	seen := map[string]bool{}
+	var urls []string
+	for _, m := range re.FindAllStringSubmatch(checkoutHTML, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		if boChunkSkipRe.MatchString(m[1]) {
+			continue
+		}
+		u := shopURL + m[1]
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		urls = append(urls, u)
+	}
+	return urls
+}
+
+// fetchPersistedQueryIDs locates the Proposal / SubmitForCompletion /
+// PollForReceipt persisted-query IDs for a checkout session. Legacy builds
+// carry them in an actions*.js chunk; newer builds use hash-named chunks,
+// so we scan the checkout's chunks (in parallel, with early exit) when the
+// actions chunk is missing or incomplete.
+func fetchPersistedQueryIDs(client tls_client.HttpClient, shopURL, checkoutHTML string) (proposalID, submitID, pollID string, err error) {
+	// Fast path: legacy actions chunk contains Proposal + SubmitForCompletion.
+	if actionsURL := extractActionsJSURL(checkoutHTML, shopURL); actionsURL != "" {
+		if jsBody, ferr := fetchActionsJS(client, actionsURL, shopURL); ferr == nil {
+			proposalID = extractProposalID(jsBody)
+			submitID = extractSubmitForCompletionID(jsBody)
+			pollID = extractPollForReceiptID(jsBody)
+			if proposalID != "" && submitID != "" {
+				return proposalID, submitID, pollID, nil
+			}
+		}
+	}
+
+	// Scan path: hash-named chunks. Poll chunks can be huge (800KB+), so cap
+	// concurrency and stop as soon as every ID is found.
+	candidates := extractCheckoutChunkURLs(checkoutHTML, shopURL)
+	if len(candidates) == 0 {
+		return "", "", "", fmt.Errorf("no checkout JS chunks found in checkout HTML")
+	}
+
+	type chunkResult struct {
+		proposal, submit, poll string
+	}
+	results := make(chan chunkResult, len(candidates))
+	sem := make(chan struct{}, 24)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	done := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return proposalID != "" && submitID != "" && pollID != ""
+	}
+	for _, u := range candidates {
+		if done() {
+			break
+		}
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			if done() {
+				return
+			}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if done() {
+				return
+			}
+			jsBody, ferr := fetchActionsJS(client, url, shopURL)
+			if ferr != nil {
+				return
+			}
+			cr := chunkResult{}
+			if p := extractProposalID(jsBody); p != "" {
+				cr.proposal = p
+			}
+			if s := extractSubmitForCompletionID(jsBody); s != "" {
+				cr.submit = s
+			}
+			if p := extractPollForReceiptID(jsBody); p != "" {
+				cr.poll = p
+			}
+			results <- cr
+		}(u)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for cr := range results {
+		if cr.proposal != "" && proposalID == "" {
+			proposalID = cr.proposal
+		}
+		if cr.submit != "" && submitID == "" {
+			submitID = cr.submit
+		}
+		if cr.poll != "" && pollID == "" {
+			pollID = cr.poll
+		}
+	}
+	if proposalID == "" && submitID == "" {
+		return "", "", "", fmt.Errorf("no persisted-query IDs found in %d checkout chunks", len(candidates))
+	}
+	return proposalID, submitID, pollID, nil
+}
+
 func extractProcessingJSURL(checkoutHTML, shopURL string) string {
 	patterns := []string{
 		`(/cdn/shopifycloud/checkout-web/assets/c1/useHasOrdersFromMultipleShops[A-Za-z0-9_.-]*\.js)`,
