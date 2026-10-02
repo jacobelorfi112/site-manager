@@ -29,7 +29,9 @@ MAX_DORKS          = os.environ.get("MAX_DORKS", "")
 
 # Common Crawl bulk harvest (quarterly web index, no auth/captcha/rate limit)
 CC_ENABLED          = os.environ.get("CC_HARVEST", "1") == "1"
-CC_INDEX_ID         = os.environ.get("CC_INDEX_ID", "CC-MAIN-2026-39")
+CC_INDEX_IDS        = [i.strip() for i in os.environ.get(
+    "CC_INDEX_IDS", "CC-MAIN-2026-39,CC-MAIN-2026-34,CC-MAIN-2026-30,CC-MAIN-2026-25"
+).split(",") if i.strip()]
 CC_PAGES_PER_CYCLE  = int(os.environ.get("CC_PAGES_PER_CYCLE", "2"))
 CC_STATE_FILE       = os.environ.get("CC_STATE_FILE", "/tmp/cc_cursor.json")
 
@@ -56,66 +58,90 @@ def normalize_store_url(u):
 
 
 # ── Common Crawl bulk harvest ────────────────────────────────────────
-_cc_cursor = 0
+_cc_cursors = {idx: 0 for idx in CC_INDEX_IDS}   # per-index page cursor
 _cc_max_page = 60
+_cc_failures = {idx: 0 for idx in CC_INDEX_IDS}
+_cc_rr_idx = 0                                    # round-robin across indexes
 
 
 def _cc_load_cursor():
-    global _cc_cursor, _cc_max_page
+    global _cc_cursors, _cc_max_page
     try:
         with open(CC_STATE_FILE) as fh:
             d = json.load(fh)
-            _cc_cursor = int(d.get("cursor", 0))
+            saved = d.get("cursors", {})
+            for idx in CC_INDEX_IDS:
+                _cc_cursors[idx] = int(saved.get(idx, random.randint(0, 12)))
             _cc_max_page = int(d.get("max_page", 60))
     except Exception:
-        _cc_cursor = random.randint(0, 12)
+        _cc_cursors = {idx: random.randint(0, 12) for idx in CC_INDEX_IDS}
 
 
 def _cc_save_cursor():
     try:
         with open(CC_STATE_FILE, "w") as fh:
-            json.dump({"cursor": _cc_cursor, "max_page": _cc_max_page}, fh)
+            json.dump({"cursors": _cc_cursors, "max_page": _cc_max_page}, fh)
     except Exception:
         pass
 
 
+def _cc_fetch_page(index_id, page):
+    """Fetch one index page, return set of unique store roots. None on failure."""
+    url = (f"https://index.commoncrawl.org/{index_id}-index"
+           f"?url=*.myshopify.com&output=json&page={page}")
+    try:
+        r = requests.get(url, timeout=180,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; site-scraper)"})
+    except Exception as e:
+        print(f"[CC] {index_id} page {page} error: {e.__class__.__name__}", flush=True)
+        return None
+    if r.status_code != 200:
+        print(f"[CC] {index_id} page {page} HTTP {r.status_code}", flush=True)
+        return None
+    stores = set()
+    for line in r.text.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            u = json.loads(line).get("url", "")
+        except Exception:
+            continue
+        s = normalize_store_url(u)
+        if s and not s.startswith("https://www."):
+            stores.add(s)
+    return stores
+
+
 def harvest_common_crawl():
-    """Fetch pages of *.myshopify.com URLs from the Common Crawl CDX index.
-    Each page ≈ 15,000 records → thousands of unique store roots.
+    """Fetch pages of *.myshopify.com URLs from Common Crawl quarterly indexes.
+    Round-robins across all configured crawls (39/34/30/25...) — each crawl is a
+    different snapshot, so union coverage far exceeds any single one.
     No auth, no captcha, no rate limit (be gentle: ~10s between pages)."""
-    global _cc_cursor, _cc_max_page
-    if not CC_ENABLED:
+    global _cc_cursors, _cc_max_page, _cc_rr_idx
+    if not CC_ENABLED or not CC_INDEX_IDS:
         return 0
     inserted_total = 0
     for _ in range(CC_PAGES_PER_CYCLE):
-        url = (f"https://index.commoncrawl.org/{CC_INDEX_ID}-index"
-               f"?url=*.myshopify.com&output=json&page={_cc_cursor}")
-        try:
-            r = requests.get(url, timeout=180,
-                             headers={"User-Agent": "Mozilla/5.0 (compatible; site-scraper)"})
-        except Exception as e:
-            print(f"[CC] page {_cc_cursor} error: {e.__class__.__name__}", flush=True)
-            break
-        if r.status_code != 200:
-            print(f"[CC] page {_cc_cursor} HTTP {r.status_code} — resetting cursor", flush=True)
-            _cc_cursor = random.randint(0, 12)
-            break
-        stores = set()
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                u = json.loads(line).get("url", "")
-            except Exception:
-                continue
-            s = normalize_store_url(u)
-            if s and not s.startswith("https://www."):
-                stores.add(s)
-        done_page = _cc_cursor
-        _cc_cursor += 1
-        if _cc_cursor >= _cc_max_page:
-            _cc_cursor = random.randint(0, 12)
+        idx = CC_INDEX_IDS[_cc_rr_idx % len(CC_INDEX_IDS)]
+        _cc_rr_idx += 1
+        page = _cc_cursors.get(idx, 0)
+        stores = _cc_fetch_page(idx, page)
+        if stores is None:
+            _cc_failures[idx] = _cc_failures.get(idx, 0) + 1
+            _cc_cursors[idx] = random.randint(0, 12)
+            # bad index (404) or end-of-index — drop it after 3 strikes
+            if _cc_failures[idx] >= 3:
+                print(f"[CC] dropping {idx} after {_cc_failures[idx]} failures", flush=True)
+                CC_INDEX_IDS.remove(idx)
+                _cc_rr_idx = 0
+                if not CC_INDEX_IDS:
+                    break
+            continue
+        _cc_failures[idx] = 0
+        _cc_cursors[idx] = page + 1
+        if _cc_cursors[idx] >= _cc_max_page:
+            _cc_cursors[idx] = random.randint(0, 12)
         if stores:
             batch = []
             for s in sorted(stores):
@@ -125,9 +151,9 @@ def harvest_common_crawl():
                     batch = []
             if batch:
                 inserted_total += insert_sites(batch)
-            print(f"[CC] page {done_page}: {len(stores)} stores harvested", flush=True)
+            print(f"[CC] {idx} page {page}: {len(stores)} stores harvested", flush=True)
         else:
-            print(f"[CC] page {done_page}: 0 stores", flush=True)
+            print(f"[CC] {idx} page {page}: 0 stores", flush=True)
         _cc_save_cursor()
         time.sleep(10)
     return inserted_total
@@ -197,7 +223,7 @@ def main():
     print(f"Scraper Worker v{SCRAPER_VERSION} starting", flush=True)
     print(f"  Site Manager: {SITE_MANAGER_URL}", flush=True)
     print(f"  Engines: paulgo (SearXNG) + NeoSearch + Yahoo + Naver + Baidu + BingRSS (round-robin)", flush=True)
-    print(f"  Common Crawl harvest: {'ON (index ' + CC_INDEX_ID + ', ' + str(CC_PAGES_PER_CYCLE) + ' pages/cycle)' if CC_ENABLED else 'OFF'}", flush=True)
+    print(f"  Common Crawl harvest: {'ON (' + ' + '.join(CC_INDEX_IDS) + ', ' + str(CC_PAGES_PER_CYCLE) + ' pages/cycle)' if CC_ENABLED else 'OFF'}", flush=True)
     print(f"  Dork file: {DORKS_FILE}", flush=True)
     print(f"  Pages per dork: {MAX_PAGES or 'unlimited (until no results)'}", flush=True)
     print(f"  Cycle delay: {CYCLE_DELAY}s", flush=True)
