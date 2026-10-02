@@ -31,7 +31,7 @@ import requests
 urllib3.disable_warnings()
 
 # ── Config ──────────────────────────────────────────────────────────
-SITE_MANAGER_URL   = os.environ.get("SITE_MANAGER_URL", "")
+SITE_MANAGER_URL   = "https://cf-site-manager.anonchat-notlak3.workers.dev"
 DATABASE_URL       = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE         = int(os.environ.get("SCRAPER_BATCH_SIZE", "100"))
 REQUESTS_PER_CYCLE = int(os.environ.get("SCRAPER_REQUESTS", "30"))
